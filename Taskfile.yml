@@ -1,0 +1,97 @@
+version: '3'
+
+tasks:
+  fmt:
+    desc: Check formatting (pass files to check specific ones; use fmt:fix to apply)
+    vars:
+      # FIX is set by fmt:fix; leading space in CHECK avoids double spaces in the cmd
+      FIX: '{{.FIX | default "false"}}'
+      CHECK: '{{if ne .FIX "true"}} --check{{end}}'
+    cmds:
+      # Specific files go through rustfmt, otherwise cargo fmt over the whole package
+      - |
+        {{if .CLI_ARGS -}}
+          rustfmt{{.CHECK}} {{.CLI_ARGS}}
+        {{- else -}}
+          cargo fmt{{.CHECK}}
+        {{- end}}
+
+  fmt:fix:
+    desc: Apply formatting (optionally to specific files)
+    cmds:
+      - task: fmt
+        vars: { FIX: "true", CLI_ARGS: "{{.CLI_ARGS}}" }
+
+  clippy:
+    desc: Run clippy lints
+    cmd: cargo clippy --all-targets --all-features -- -D warnings
+
+  lint:
+    desc: Run fmt check and clippy
+    deps: [fmt, clippy]
+
+  lint:fix:
+    desc: Fix formatting and run clippy
+    deps: [fmt:fix, clippy]
+
+  test:
+    desc: Run all tests
+    cmd: cargo test
+
+  check:
+    desc: Run linting and testing
+    cmds:
+      - task: lint
+      - task: test
+
+  clean:
+    desc: Clean build artifacts
+    cmd: cargo clean
+
+  build:
+    desc: Build release binary
+    cmds:
+      - cargo build --release
+    sources:
+      - Cargo.toml
+      - Cargo.lock
+      - src/**/*.rs
+    generates:
+      - target/release/vigil
+    method: timestamp
+
+  run:
+    desc: Build and run (pass args after --)
+    cmds:
+      - task: build
+        silent: true
+      - cmd: ./target/release/vigil {{.CLI_ARGS}}
+        ignore_error: true
+
+  watch:lint:
+    desc: Watch for changes and run linting
+    watch: true
+    sources:
+      - src/**/*.rs
+      - Cargo.toml
+    method: checksum
+    cmds:
+      - clear
+      - task: lint
+
+  watch:test:
+    desc: Watch for changes and run linting & tests
+    watch: true
+    sources:
+      - src/**/*.rs
+      - Cargo.toml
+    method: timestamp
+    cmds:
+      - clear
+      - task: check
+
+  default:
+    desc: List available tasks
+    silent: true
+    cmds:
+      - task --list

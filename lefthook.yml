@@ -1,0 +1,13 @@
+commit-msg:
+  commands:
+    conventional-commit:
+      run: cog verify --file {1}
+
+pre-commit:
+  commands:
+    fmt:
+      glob: "*.rs"
+      run: task fmt:fix -- {staged_files}
+      stage_fixed: true
+    lint:
+      run: task lint

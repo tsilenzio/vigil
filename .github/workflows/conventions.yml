@@ -1,0 +1,68 @@
+name: Conventions
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  commits:
+    name: Commit Messages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install cocogitto
+        run: cargo install cocogitto --locked
+      - name: Check commits
+        run: cog check
+
+  branch-name:
+    name: Branch Name
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch name
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          pattern='^(feat|fix|refactor|docs|ci|chore|test|perf|build|style|revert)/.+$'
+          if [[ ! "$BRANCH" =~ $pattern ]]; then
+            echo "::error::Branch name '$BRANCH' does not follow convention."
+            echo ""
+            echo "Expected: <type>/<description>"
+            echo "Types: feat, fix, refactor, docs, ci, chore, test, perf, build, style, revert"
+            echo "Example: feat/add-user-auth, fix/login-crash"
+            exit 1
+          fi
+
+  pr-format:
+    name: PR Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR body
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [[ -z "$PR_BODY" ]]; then
+            echo "::error::PR body is empty. Please use the pull request template."
+            exit 1
+          fi
+
+          missing=()
+          echo "$PR_BODY" | grep -q '^## Summary' || missing+=("## Summary")
+          echo "$PR_BODY" | grep -q '^## Test plan' || missing+=("## Test plan")
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::PR body is missing required sections: ${missing[*]}"
+            echo ""
+            echo "Please include these sections in your PR description:"
+            for section in "${missing[@]}"; do
+              echo "  - $section"
+            done
+            exit 1
+          fi
