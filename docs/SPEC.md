@@ -1,6 +1,6 @@
 # vigil: Technical Specification
 
-Last Updated: 2026-07-02
+Last Updated: 2026-07-08
 
 ## Overview & Motivation
 
@@ -43,13 +43,16 @@ for normal turns but has two gaps:
 vigil replaces the per-turn model with an **event-log-driven supervisor**:
 
 - Claude Code hooks invoke `vigil record <event>` on each lifecycle event. The
-  recorder appends one line to a per-session event log and ensures the daemon is
-  running. It does no interpretation and spawns no `caffeinate`.
+  recorder appends one line to a per-session event log, capturing the session's
+  `claude` process identity so the daemon can track liveness, and ensures the daemon
+  is running. It does no interpretation and spawns no `caffeinate`.
 - A single `vigil daemon` reference-counts active sessions by reading the logs and
   owns exactly one `caffeinate -di` assertion. It keeps the assertion while any
   session is active and releases it when all sessions go idle.
-- Release is driven by staleness, not by a stop event, so an interrupt that fires
-  no hook is handled the same as any other idle period.
+- Release is reactive. The daemon runs a kqueue event loop that wakes the instant a
+  session's `claude` process exits (including a `SIGKILL`, which fires no hook) or a
+  turn is interrupted with Esc. A per-session idle timeout is the backstop for a
+  session that stops logging with no other signal.
 - The timeout applied to a session is extended while that session's most recent
   event is an in-flight `git commit`, which keeps the display awake through the
   Touch ID and password-fallback wait.
@@ -76,8 +79,8 @@ configuration file (constants are compiled in for this version).
 - **Event logs** (`/tmp/vigil/<session_id>.jsonl`). One append-only JSONL file per
   Claude Code session. The shared state between recorder and daemon.
 - **Daemon** (`vigil daemon`). One instance per machine, guarded by an advisory
-  lock. Polls the logs, decides the desired assertion state, and owns one
-  `caffeinate` child.
+  lock. Runs a reactive kqueue event loop over the session logs and the processes
+  they name, decides the desired assertion state, and owns one `caffeinate` child.
 - **caffeinate**. A single `caffeinate -di` process, spawned and killed by the
   daemon. `-d` prevents display sleep, `-i` prevents system idle sleep.
 
@@ -86,10 +89,14 @@ configuration file (constants are compiled in for this version).
 ```
 hook event ──▶ vigil record ──▶ append line to /tmp/vigil/<sid>.jsonl
                     │                       │
-                    └── ensure daemon ──▶  vigil daemon (poll loop)
-                                               │ read last line of each *.jsonl
-                                               │ compute per-session staleness
-                                               ▼
+                    └── ensure daemon ──▶  vigil daemon (kqueue event loop)
+                                               │ per session: register its PID
+                                               │ (EVFILT_PROC) and transcript
+                                               │ (EVFILT_VNODE)
+                                               ├─ process exit  ─▶ release session
+                                               ├─ Esc interrupt ─▶ release session
+                                               └─ timeout tick  ─▶ scan logs, staleness,
+                                                     power, battery, self-exit
                                   any active? ── yes ─▶ ensure caffeinate -di
                                                └─ no ──▶ kill caffeinate, exit
 ```
@@ -107,7 +114,7 @@ at `/tmp/vigil/daemon.lock`. The recorder creates `/tmp/vigil/` if absent.
 One JSON object per line, appended in event order:
 
 ```json
-{"ts":1751490000,"event":"PreToolUse","tool":"Bash","command":"git commit -m \"x\"","agent_id":null}
+{"ts":1751490000,"event":"PreToolUse","tool":"Bash","command":"git commit -m \"x\"","agent_id":null,"pid":18248,"pid_start":"Thu Jul 2 20:20:25 2026","transcript":"/Users/.../<sid>.jsonl"}
 ```
 
 Fields:
@@ -118,9 +125,17 @@ Fields:
 - `command` (string, optional): the command string, present when `tool` is `Bash`.
 - `agent_id` (string or null, optional): non-null when the event came from a
   subagent's tool call (see Subagents).
+- `pid` (u32, optional): the session's `claude` process id, captured by the recorder
+  for liveness.
+- `pid_start` (string, optional): that process's start time. The `(pid, start)` pair
+  is the liveness key and survives PID reuse, since a reused PID carries a newer
+  start time.
+- `transcript` (string, optional): path to the session transcript, watched for the
+  Esc-interrupt marker.
 
-The recorder extracts `session_id`, `tool_name`, `tool_input.command`, and
-`agent_id` from the hook JSON on stdin. Absent fields are omitted or null.
+The recorder extracts `session_id`, `tool_name`, `tool_input.command`, `agent_id`,
+and `transcript_path` from the hook JSON on stdin, and captures the `claude` process
+identity by walking its own ancestry. Absent fields are omitted or null.
 
 ### Event Types
 
@@ -139,10 +154,17 @@ trailing partial line by ignoring it.
 ### Lifecycle & Cleanup
 
 - `Stop`, `StopFailure`, and `SessionEnd` cause the recorder to delete the
-  session's log. The turn or session has ended and the session stops voting.
-- Esc fires no hook, so an interrupted session's log stops growing with a stale
-  final line. The daemon garbage-collects any log whose newest line is older than
-  the GC threshold.
+  session's log. The turn or session has ended and the session stops voting; the
+  daemon notices the removal on its next housekeeping tick.
+- A session's `claude` process exiting, including a `SIGKILL` that fires no hook, is
+  detected reactively through the PID registered with kqueue, and the daemon
+  releases and removes that session at once.
+- An Esc interrupt fires no hook and leaves the process alive. It writes an
+  interrupt marker to the session transcript, which the daemon reads reactively on
+  the transcript's next write, then releases the session.
+- A session whose log goes stale with no other signal is caught by the idle-timeout
+  backstop, and its log is garbage-collected once its newest line ages past the GC
+  threshold.
 - Reboot clears `/tmp` as the final backstop.
 
 ## Hook Contract
@@ -182,17 +204,62 @@ future use and is not consulted by the caffeinate logic.
 
 ### Single-instance (flock)
 
-The daemon acquires an advisory exclusive lock on `/tmp/vigil/daemon.lock` (flock,
-via the `fs2` crate or equivalent) and holds it for its lifetime. A second daemon
-that fails to acquire the lock exits immediately. The recorder relies on this: it
-attempts to spawn a daemon after every event, and a redundant spawn is a no-op.
+The daemon acquires an advisory exclusive lock on `/tmp/vigil/daemon.lock`
+(`flock(2)`, through `std::fs::File::try_lock`) and holds it for its lifetime. A
+second daemon that fails to acquire the lock exits immediately. The recorder relies
+on this: it attempts to spawn a daemon after every event, and a redundant spawn is a
+no-op.
+
+### Session liveness (process identity)
+
+Staleness alone cannot distinguish a killed session from an idle one, and it delays
+release by the full timeout. To release a dead session at once, each event carries
+the session's `claude` process identity. A hook runs as a descendant of that
+process, so the recorder walks its own ancestry (via `ps`) to the nearest `claude`
+ancestor and records that process's `pid` and start time. The `(pid, start)` pair is
+the liveness key: a reused PID carries a newer start time and reads as dead, so a
+recycled PID never keeps the display awake. The daemon registers a live PID for
+reactive exit notification, and releases a session whose PID is already dead the
+first time it scans that log.
+
+### Reactive event sources
+
+Release decisions are driven by kqueue rather than by polling:
+
+- Each session's `claude` PID is registered with `EVFILT_PROC` / `NOTE_EXIT`. The
+  kernel delivers the exit event even for a `SIGKILL` that runs no shutdown code and
+  fires no hook, and the registration binds to the process, so it is immune to PID
+  reuse.
+- Each session's transcript is registered with `EVFILT_VNODE` / `NOTE_WRITE`. An Esc
+  interrupt writes a marker line (`[Request interrupted by user`) to the transcript
+  and fires no hook. The write wakes the daemon, which reads the newest transcript
+  line and releases the session if it is the marker. The read is fail-open: an
+  unreadable or reshaped transcript reads as not-interrupted and falls through to the
+  staleness backstop.
+
+A new turn (a created log) and a `Stop` / `SessionEnd` (a deleted log) are noticed on
+the housekeeping tick, within `POLL_INTERVAL`.
 
 ### Supervisor loop
 
-Poll every `POLL_INTERVAL`:
+The daemon blocks in the kqueue, waking on a reactive event or, failing that, on a
+housekeeping timeout of `POLL_INTERVAL`. Reactive wakeups release a session as soon
+as its process exits or its turn is interrupted. The timeout drives the periodic work
+that cannot be pushed reactively: the staleness scan, power polling, the battery
+timers, `caffeinate` respawn, and self-exit.
 
 ```
 loop:
+    event = kqueue_wait(timeout = POLL_INTERVAL)
+    match event:
+        process-exit(pid):        # EVFILT_PROC / NOTE_EXIT, fires even on SIGKILL
+            remove the log of the session that recorded this pid
+        transcript-write(path):   # EVFILT_VNODE / NOTE_WRITE
+            if newest transcript line is the interrupt marker:
+                remove that session's log
+        timeout:
+            pass                  # fall through to housekeeping
+
     now = epoch_seconds()
     refresh_power_source_if_due()            # pmset -g ps, cached POWER_POLL_INTERVAL
 
@@ -200,6 +267,9 @@ loop:
     for path in glob("/tmp/vigil/*.jsonl"):
         last = read_last_line(path)          # None if empty/partial-only
         if last is None: continue
+        if last.pid is newly seen:
+            register it (EVFILT_PROC) if alive, else remove the log and continue
+        register last.transcript (EVFILT_VNODE) if newly seen
         idle = now - last.ts
         limit = COMMIT_TIMEOUT if is_unmatched_commit(last) else STANDARD_TIMEOUT
         if idle < limit:
@@ -226,22 +296,25 @@ loop:
         hold_since = None                            # end the hold period
         stop_caffeinate()
 
+    # Self-exit advances only on housekeeping timeouts, not reactive wakeups, so the
+    # grace window stays ~EXIT_GRACE * POLL_INTERVAL.
     if active:
-        idle_polls = 0
-    else:
-        idle_polls += 1
-        if idle_polls >= EXIT_GRACE:
+        idle_ticks = 0
+    else if event is timeout:
+        idle_ticks += 1
+        if idle_ticks >= EXIT_GRACE:
             stop_caffeinate()
             release_lock_and_exit()          # battery_capped resets with the daemon
-    sleep(POLL_INTERVAL)
 ```
 
-### Reference counting & staleness
+### Reference counting & the staleness backstop
 
 A session counts as active when the idle time since its newest log line is under
 the applicable timeout. The assertion is held while any session is active. This
 covers concurrent sessions and subagents without special cases, since each is (or
-refreshes) a session log.
+refreshes) a session log. Staleness is no longer the primary release path, reactive
+process-exit and interrupt handle the common cases, but it remains the backstop for
+a session that stops logging with no exit and no interrupt to react to.
 
 ### Commit-aware timeout
 
@@ -278,12 +351,13 @@ period.
 
 ### Self-exit & crash recovery
 
-The daemon exits after `EXIT_GRACE` consecutive idle polls, killing its caffeinate
-child first. The `EXIT_GRACE` window absorbs the race where a recorder appends a
-fresh line and spawns a daemon just as the current daemon decides to exit. On
-normal exit the caffeinate child is killed. On abnormal termination (SIGKILL, no
-cleanup), the `-t SAFETY_SECS` cap causes the orphaned caffeinate to self-expire,
-and the next recorder respawns a fresh daemon.
+The daemon exits after `EXIT_GRACE` consecutive idle housekeeping ticks, killing its
+caffeinate child first. Advancing the counter only on the timeout tick, not on
+reactive wakeups, keeps the grace window at roughly `EXIT_GRACE * POLL_INTERVAL` even
+under a burst of reactive events. The window also absorbs the race where a recorder
+appends a fresh line and spawns a daemon just as the current daemon decides to exit.
+On abnormal termination (SIGKILL, no cleanup), the `-t SAFETY_SECS` cap causes the
+orphaned caffeinate to self-expire, and the next recorder respawns a fresh daemon.
 
 ### Power source & battery cap
 
@@ -323,8 +397,10 @@ Compiled-in constants for this version (a `config` module):
   lapse does not sleep the display mid-turn.
 - `COMMIT_TIMEOUT` = 300s. Applied while a commit is in flight. Covers the Touch
   ID sheet plus password-fallback entry.
-- `POLL_INTERVAL` = 2s.
-- `EXIT_GRACE` = 2 polls.
+- `POLL_INTERVAL` = 2s. The kqueue wait timeout and the housekeeping cadence: the
+  daemon blocks up to this long for a reactive event, then runs the staleness scan
+  and the power, battery, and self-exit housekeeping.
+- `EXIT_GRACE` = 2 housekeeping ticks.
 - `GC_THRESHOLD` = 300s. Delete logs whose newest line is older than this.
 - `SAFETY_SECS` = 1800s (30 minutes). caffeinate self-expiry backstop.
 - `BATTERY_FLOOR_PCT` = 35. On battery, the assertion is released once the charge
@@ -393,16 +469,21 @@ even when the append fails, to protect the turn.
 - `main.rs`: `main() -> ExitCode` delegating to `run() -> Result<ExitCode, Error>`.
 - `cli.rs`: `clap` derive definitions (`record <EVENT>`, `daemon`, `status`).
 - `error.rs`: `thiserror` `Error` enum with `exit_code()` and `From` conversions.
-- `event.rs`: the line schema (serde types), append, read-last-line, delete,
-  and commit detection.
-- `daemon.rs`: single-instance lock, the poll loop, reference counting, self-exit,
-  power-source polling, and the battery hold cap.
+- `event.rs`: the line schema (serde types), append, read-last-line, delete, commit
+  detection, and the transcript interrupt-marker check.
+- `proc.rs`: capture of the session's `claude` process identity (PID and start time)
+  by ancestry walk, and the liveness check that guards against PID reuse.
+- `watch.rs`: the kqueue wrapper, registering PIDs (`EVFILT_PROC`) and transcripts
+  (`EVFILT_VNODE`) and returning reactive wake events.
+- `daemon.rs`: single-instance lock, the reactive event loop, reference counting,
+  self-exit, power-source polling, and the battery hold cap.
 - `caffeinate.rs`: spawn and kill the one caffeinate child.
 - `config.rs`: the timeout constants and paths.
 
-Dependencies follow the rune-keychain baseline plus JSON, locking, and detachment:
-`clap` (derive), `thiserror`, `serde` + `serde_json`, `fs2` (or an equivalent
-flock), and `libc` (for `setsid`).
+Dependencies follow the rune-keychain baseline plus JSON and detachment: `clap`
+(derive), `thiserror`, `serde` + `serde_json`, `kqueue` (the reactive event loop),
+and `libc` (for `setsid` and PID registration). The single-instance lock uses the
+standard library's `File::try_lock` rather than a separate flock crate.
 
 ## Implementation Notes
 
@@ -439,6 +520,8 @@ extraction for a log line:
 - `agent_id` = `.agent_id` if present, else null. Present (a string) only when the
   tool ran inside a subagent, absent for the main agent. Recorded, not used by the
   caffeinate logic.
+- `transcript` = `.transcript_path` (present on tool events; watched by the daemon
+  for the Esc-interrupt marker).
 
 `UserPromptSubmit`, `Stop`, `StopFailure`, and `SessionEnd` carry `session_id` at
 top level, which is all the recorder needs from them (the event name comes from the
@@ -464,6 +547,16 @@ unsafe {
 The single-instance flock makes a redundant spawn a no-op, so `record` can always
 attempt it.
 
+### Process identity capture
+
+The recorder resolves the session's `claude` process by running `ps` once and
+walking parent links from its own PID up to the nearest ancestor whose command
+contains `claude`, bounded to a small depth. The match is a substring so an
+app-forked session whose command is a versioned binary path still resolves. The
+recorded start time is compared against a fresh `ps -o lstart=` read for the liveness
+check, normalizing whitespace so a single-digit day (which `ps` pads with a double
+space) still matches.
+
 ### Power source detection
 
 Parse the first line of `pmset -g ps`:
@@ -479,7 +572,7 @@ charge level the floor guard needs, the integer before `%` (`94` here); parse it
 with a `NN%` match on that line. The charge state (`discharging` / `charging` /
 `charged`) and time remaining are also on that line if `status` wants them. Shelling
 `pmset` every `POWER_POLL_INTERVAL` and caching between avoids spawning it on every
-2s poll.
+2s tick.
 
 ### Test methodology
 
@@ -523,11 +616,14 @@ is confirmed stable, then retired.
 - Line schema round-trip (serialize then parse).
 - `read_last_line` on empty, single-line, multi-line, and trailing-partial files.
 - Staleness and timeout selection given a synthetic newest line.
+- Interrupt-marker detection on a transcript's newest line.
+- Process-identity ancestry walk and the start-time liveness comparison.
 
 ### Scenario matrix (manual, end-to-end)
 
 1. Normal turn: assertion held during the turn, released after idle timeout.
-2. Esc mid-turn then walk away: assertion released within `STANDARD_TIMEOUT`.
+2. Esc mid-turn then walk away: assertion released reactively on the interrupt
+   marker, with `STANDARD_TIMEOUT` as the backstop.
 3. Commit then AFK: the commit's `PreToolUse` holds `COMMIT_TIMEOUT`, and the
    display stays awake through the Touch ID / password wait.
 4. Subagent tool use: a single caffeinate stays held during subagent work, none
