@@ -5,6 +5,7 @@ mod daemon;
 mod error;
 mod event;
 mod proc;
+mod watch;
 
 use std::io::Read;
 use std::process::ExitCode;

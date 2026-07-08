@@ -1,5 +1,8 @@
-//! The supervisor: single-instance lock, the poll loop, reference counting,
-//! self-exit, power-source polling, and the battery hold cap.
+//! The supervisor: single-instance lock, the reactive kqueue event loop,
+//! reference counting, self-exit, power-source polling, and the battery hold cap.
+//! Release on process death is reactive (ADR-0011); the housekeeping tick handles
+//! power, battery timers, caffeinate respawn, self-exit, and the staleness
+//! backstop.
 
 use std::fs::{self, File};
 use std::os::unix::process::CommandExt;
@@ -12,6 +15,8 @@ use crate::caffeinate::Caffeinate;
 use crate::config;
 use crate::error::Error;
 use crate::event::{self, Event};
+use crate::proc::{self, ProcId};
+use crate::watch::SessionWatch;
 
 /// Spawn `vigil daemon` detached in a new session so it outlives the recorder.
 /// Best-effort: the single-instance lock makes a redundant spawn a no-op, so
@@ -50,14 +55,32 @@ pub fn run() -> Result<ExitCode, Error> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let mut watch = SessionWatch::new()?;
     let mut caffeinate = Caffeinate::default();
     let mut power = read_power().unwrap_or_else(PowerState::assume_ac);
     let mut last_power_poll = event::now_secs();
     let mut battery_capped = false;
     let mut hold_since: Option<u64> = None;
-    let mut idle_polls: u32 = 0;
+    let mut idle_ticks: u32 = 0;
 
     loop {
+        // Reactive wait: block up to POLL_INTERVAL for a watched process to exit.
+        // With nothing registered the kqueue would return immediately, so sleep
+        // instead to keep the housekeeping cadence steady.
+        let interval = Duration::from_secs(config::POLL_INTERVAL);
+        let timed_out = if watch.is_empty() {
+            thread::sleep(interval);
+            true
+        } else {
+            match watch.poll(interval) {
+                Some(dead_pid) => {
+                    remove_logs_for_pid(dead_pid);
+                    false
+                }
+                None => true,
+            }
+        };
+
         let now = event::now_secs();
         if now.saturating_sub(last_power_poll) >= config::POWER_POLL_INTERVAL {
             if let Some(fresh) = read_power() {
@@ -66,7 +89,7 @@ pub fn run() -> Result<ExitCode, Error> {
             last_power_poll = now;
         }
 
-        let active = evaluate_sessions(now);
+        let active = evaluate_sessions(now, &mut watch);
 
         // Battery cap: two guards OR'd, whichever fires first. The latch clears
         // only on AC; on battery a fired guard stays latched until AC returns or
@@ -93,28 +116,47 @@ pub fn run() -> Result<ExitCode, Error> {
             caffeinate.stop();
         }
 
+        // Self-exit advances only on housekeeping ticks, not on reactive death
+        // wakeups, so the grace window stays ~EXIT_GRACE * interval.
         if active {
-            idle_polls = 0;
-        } else {
-            idle_polls += 1;
-            if idle_polls >= config::EXIT_GRACE {
+            idle_ticks = 0;
+        } else if timed_out {
+            idle_ticks += 1;
+            if idle_ticks >= config::EXIT_GRACE {
                 caffeinate.stop();
                 return Ok(ExitCode::SUCCESS);
             }
         }
-
-        thread::sleep(Duration::from_secs(config::POLL_INTERVAL));
     }
 }
 
-/// Scan every session log once. Returns whether any session is active and
-/// garbage-collects logs whose newest line has aged past the GC threshold.
-fn evaluate_sessions(now: u64) -> bool {
+/// Scan every session log once: register any newly-seen live PID for reactive
+/// exit notification, drop a session whose process is already gone, GC logs past
+/// the staleness backstop, and return whether any session is active.
+fn evaluate_sessions(now: u64, watch: &mut SessionWatch) -> bool {
     let mut active = false;
     for path in session_logs() {
         let Some(last) = event::read_last_line(&path) else {
             continue;
         };
+
+        // Liveness: register a new live PID; a PID already dead or reused at first
+        // sight releases here instead of waiting for the staleness backstop.
+        if let Some(pid) = last.pid
+            && !watch.is_watched(pid)
+        {
+            let id = ProcId {
+                pid,
+                start: last.pid_start.clone().unwrap_or_default(),
+            };
+            if proc::is_alive(&id) {
+                watch.watch_pid(pid);
+            } else {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+        }
+
         let idle = now.saturating_sub(last.ts);
         if idle < timeout_for(&last) {
             active = true;
@@ -123,6 +165,17 @@ fn evaluate_sessions(now: u64) -> bool {
         }
     }
     active
+}
+
+/// Delete the log of the session whose recorded PID matches an exited process.
+fn remove_logs_for_pid(pid: u32) {
+    for path in session_logs() {
+        if let Some(last) = event::read_last_line(&path)
+            && last.pid == Some(pid)
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 fn timeout_for(last: &Event) -> u64 {

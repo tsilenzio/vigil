@@ -54,6 +54,27 @@ fn parse_table(output: &str) -> HashMap<u32, Entry> {
     table
 }
 
+/// Whether the recorded process is still the live `claude` process: its PID is up
+/// and its start time still matches. A reused PID carries a newer start time and
+/// reads as dead. Used to guard a kqueue registration against a stale/reused PID.
+pub fn is_alive(id: &ProcId) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &id.pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && start_matches(&String::from_utf8_lossy(&output.stdout), &id.start)
+}
+
+/// Compare a raw `ps -o lstart=` line to a recorded start time, normalizing
+/// whitespace the same way `parse_table` does (single-digit days emit a double
+/// space that collapses to one).
+fn start_matches(ps_lstart: &str, recorded: &str) -> bool {
+    let normalized = ps_lstart.split_whitespace().collect::<Vec<_>>().join(" ");
+    !normalized.is_empty() && normalized == recorded
+}
+
 fn walk_to_claude(table: &HashMap<u32, Entry>, start_pid: u32) -> Option<ProcId> {
     let mut pid = start_pid;
     for _ in 0..MAX_DEPTH {
@@ -100,6 +121,20 @@ mod tests {
             "42 1 Thu Jul  2 20:20:25 2026 /Users/x/.local/share/claude/versions/2.1.154",
         );
         assert_eq!(walk_to_claude(&table, 42).unwrap().pid, 42);
+    }
+
+    #[test]
+    fn start_matches_normalizes_whitespace() {
+        // ps emits a double space before a single-digit day; recorded is collapsed.
+        assert!(start_matches(
+            "Thu Jul  2 20:20:25 2026\n",
+            "Thu Jul 2 20:20:25 2026"
+        ));
+        assert!(!start_matches(
+            "Thu Jul  2 20:20:25 2026",
+            "Fri Jul 3 08:00:00 2026"
+        ));
+        assert!(!start_matches("", "Thu Jul 2 20:20:25 2026"));
     }
 
     #[test]
