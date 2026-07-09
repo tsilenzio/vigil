@@ -1,6 +1,6 @@
 # vigil: Technical Specification
 
-Last Updated: 2026-07-08
+Last Updated: 2026-07-09
 
 ## Overview & Motivation
 
@@ -90,13 +90,14 @@ configuration file (constants are compiled in for this version).
 hook event ──▶ vigil record ──▶ append line to /tmp/vigil/<sid>.jsonl
                     │                       │
                     └── ensure daemon ──▶  vigil daemon (kqueue event loop)
-                                               │ per session: register its PID
-                                               │ (EVFILT_PROC) and transcript
-                                               │ (EVFILT_VNODE)
-                                               ├─ process exit  ─▶ release session
-                                               ├─ Esc interrupt ─▶ release session
-                                               └─ timeout tick  ─▶ scan logs, staleness,
-                                                     power, battery, self-exit
+                                               │ watch the log dir (EVFILT_VNODE),
+                                               │ each session's PID (EVFILT_PROC)
+                                               │ and transcript (EVFILT_VNODE)
+                                               ├─ log created/deleted ─▶ re-evaluate
+                                               ├─ process exit        ─▶ release session
+                                               ├─ Esc interrupt       ─▶ release session
+                                               └─ timeout tick        ─▶ staleness, power,
+                                                     battery, self-exit
                                   any active? ── yes ─▶ ensure caffeinate -di
                                                └─ no ──▶ kill caffeinate, exit
 ```
@@ -155,7 +156,7 @@ trailing partial line by ignoring it.
 
 - `Stop`, `StopFailure`, and `SessionEnd` cause the recorder to delete the
   session's log. The turn or session has ended and the session stops voting; the
-  daemon notices the removal on its next housekeeping tick.
+  daemon notices the removal reactively through the log-directory watch.
 - A session's `claude` process exiting, including a `SIGKILL` that fires no hook, is
   detected reactively through the PID registered with kqueue, and the daemon
   releases and removes that session at once.
@@ -224,7 +225,7 @@ first time it scans that log.
 
 ### Reactive event sources
 
-Release decisions are driven by kqueue rather than by polling:
+Release and acquire decisions are driven by kqueue rather than by polling:
 
 - Each session's `claude` PID is registered with `EVFILT_PROC` / `NOTE_EXIT`. The
   kernel delivers the exit event even for a `SIGKILL` that runs no shutdown code and
@@ -236,17 +237,23 @@ Release decisions are driven by kqueue rather than by polling:
   line and releases the session if it is the marker. The read is fail-open: an
   unreadable or reshaped transcript reads as not-interrupted and falls through to the
   staleness backstop.
+- The `/tmp/vigil` log directory is registered with `EVFILT_VNODE` / `NOTE_WRITE`. A
+  created log (a new turn) or a deleted one (a `Stop` / `SessionEnd`) fires the
+  event, so acquire and clean release are reactive too. A directory write fires on
+  entry create and delete, not on the appends to the files inside, so ordinary
+  activity does not storm it.
 
-A new turn (a created log) and a `Stop` / `SessionEnd` (a deleted log) are noticed on
-the housekeeping tick, within `POLL_INTERVAL`.
+The housekeeping tick is left for the one thing that cannot be pushed reactively,
+the staleness backstop, alongside the periodic power, battery, and self-exit work.
 
 ### Supervisor loop
 
 The daemon blocks in the kqueue, waking on a reactive event or, failing that, on a
 housekeeping timeout of `POLL_INTERVAL`. Reactive wakeups release a session as soon
-as its process exits or its turn is interrupted. The timeout drives the periodic work
-that cannot be pushed reactively: the staleness scan, power polling, the battery
-timers, `caffeinate` respawn, and self-exit.
+as its process exits or its turn is interrupted, and re-evaluate when a log is
+created or deleted. The timeout drives the periodic work that cannot be pushed
+reactively: the staleness scan, power polling, the battery timers, `caffeinate`
+respawn, and self-exit.
 
 ```
 loop:
@@ -257,6 +264,8 @@ loop:
         transcript-write(path):   # EVFILT_VNODE / NOTE_WRITE
             if newest transcript line is the interrupt marker:
                 remove that session's log
+        log-dir-write:            # EVFILT_VNODE / NOTE_WRITE on /tmp/vigil
+            pass                  # a log was created or deleted; the scan below handles it
         timeout:
             pass                  # fall through to housekeeping
 
@@ -473,8 +482,8 @@ even when the append fails, to protect the turn.
   detection, and the transcript interrupt-marker check.
 - `proc.rs`: capture of the session's `claude` process identity (PID and start time)
   by ancestry walk, and the liveness check that guards against PID reuse.
-- `watch.rs`: the kqueue wrapper, registering PIDs (`EVFILT_PROC`) and transcripts
-  (`EVFILT_VNODE`) and returning reactive wake events.
+- `watch.rs`: the kqueue wrapper, registering PIDs (`EVFILT_PROC`), transcripts, and
+  the log directory (`EVFILT_VNODE`) and returning reactive wake events.
 - `daemon.rs`: single-instance lock, the reactive event loop, reference counting,
   self-exit, power-source polling, and the battery hold cap.
 - `caffeinate.rs`: spawn and kill the one caffeinate child.
