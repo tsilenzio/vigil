@@ -3,15 +3,24 @@
 
 use std::path::PathBuf;
 
-/// Idle release threshold. Above the typical gap between tool events, well under
-/// the 10-minute AC display-sleep timer.
+/// Idle release backstop. Death (`EVFILT_PROC`) and Esc-interrupt
+/// (`EVFILT_VNODE`) release reactively, and `Stop`/`SessionEnd` delete the log
+/// directly, so this only covers the residual: a session whose process could not
+/// be watched, or activity that stops with no signal. Above the typical gap
+/// between tool events, well under the 10-minute AC display-sleep timer.
 pub const STANDARD_TIMEOUT: u64 = 120;
 
-/// Applied while a commit is in flight: covers the Touch ID sheet plus any
+/// Applied while a commit is in flight. No reactive signal fires during a blocked
+/// commit (the tool has not returned, the process is alive, no interrupt), so this
+/// timeout holds the session active through the Touch ID sheet and any
 /// password-fallback entry.
 pub const COMMIT_TIMEOUT: u64 = 300;
 
-/// Daemon poll cadence, seconds.
+/// Housekeeping tick cadence, seconds, and the kqueue poll timeout. The daemon
+/// blocks up to this long for a reactive event, then does power, battery, and
+/// self-exit housekeeping. Reactive releases (death, interrupt) do not depend on
+/// it, but the non-reactive ones do: a `Stop`/`SessionEnd` log deletion and the
+/// staleness backstop are noticed on the next tick, within this interval.
 pub const POLL_INTERVAL: u64 = 2;
 
 /// Consecutive idle polls before the daemon self-exits.

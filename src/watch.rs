@@ -1,8 +1,11 @@
 //! Reactive session watching (ADR-0010, ADR-0011). Wraps a kqueue `Watcher`:
 //! each session's `claude` PID is registered with `EVFILT_PROC`/`NOTE_EXIT` for
-//! reactive death detection (SIGKILL fires no hook), and each session's transcript
+//! reactive death detection (SIGKILL fires no hook), each session's transcript
 //! with `EVFILT_VNODE`/`NOTE_WRITE` so an Esc interrupt marker is seen the instant
-//! it is written rather than at a later sample.
+//! it is written, and the log directory with `EVFILT_VNODE`/`NOTE_WRITE` so a log
+//! created or deleted (a new turn, or a `Stop`/`SessionEnd` release) wakes the
+//! daemon at once. A directory write fires on entry create/delete, not on the
+//! appends inside its files, so ordinary activity does not storm it.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -18,12 +21,15 @@ pub enum Wake {
     Exited(u32),
     /// A watched transcript was written.
     Wrote(PathBuf),
+    /// The log directory changed: a session log was created or deleted.
+    Dir,
 }
 
 pub struct SessionWatch {
     watcher: Watcher,
     pids: HashSet<u32>,
     transcripts: HashSet<PathBuf>,
+    dir: Option<PathBuf>,
 }
 
 impl SessionWatch {
@@ -32,6 +38,7 @@ impl SessionWatch {
             watcher: Watcher::new()?,
             pids: HashSet::new(),
             transcripts: HashSet::new(),
+            dir: None,
         })
     }
 
@@ -39,7 +46,29 @@ impl SessionWatch {
     /// this case, since an unstarted kqueue returns immediately rather than
     /// blocking for the timeout.
     pub fn is_empty(&self) -> bool {
-        self.pids.is_empty() && self.transcripts.is_empty()
+        self.pids.is_empty() && self.transcripts.is_empty() && self.dir.is_none()
+    }
+
+    /// Watch the log directory for created/deleted session logs. Registered once
+    /// at startup; the directory must exist.
+    pub fn watch_dir(&mut self, path: &Path) {
+        if self.dir.as_deref() == Some(path) {
+            return;
+        }
+        if self
+            .watcher
+            .add_filename(path, EventFilter::EVFILT_VNODE, FilterFlag::NOTE_WRITE)
+            .is_err()
+        {
+            return;
+        }
+        if self.watcher.watch().is_err() {
+            let _ = self
+                .watcher
+                .remove_filename(path, EventFilter::EVFILT_VNODE);
+            return;
+        }
+        self.dir = Some(path.to_path_buf());
     }
 
     pub fn is_pid_watched(&self, pid: u32) -> bool {
@@ -119,8 +148,15 @@ impl SessionWatch {
                 self.drop_pid(pid);
                 Some(Wake::Exited(pid))
             }
-            // Keep watching the transcript for later writes; do not drop it here.
-            Ident::Filename(_, path) => Some(Wake::Wrote(PathBuf::from(path))),
+            Ident::Filename(_, path) => {
+                let path = PathBuf::from(path);
+                if self.dir.as_deref() == Some(path.as_path()) {
+                    Some(Wake::Dir)
+                } else {
+                    // Keep watching the transcript for later writes; do not drop it.
+                    Some(Wake::Wrote(path))
+                }
+            }
             _ => None,
         }
     }

@@ -57,6 +57,9 @@ pub fn run() -> Result<ExitCode, Error> {
     }
 
     let mut watch = SessionWatch::new()?;
+    // Watch the log dir so a created or deleted log (a new turn, or a
+    // Stop/SessionEnd release) wakes the daemon at once.
+    watch.watch_dir(&config::vigil_dir());
     let mut caffeinate = Caffeinate::default();
     let mut power = read_power().unwrap_or_else(PowerState::assume_ac);
     let mut last_power_poll = event::now_secs();
@@ -82,6 +85,8 @@ pub fn run() -> Result<ExitCode, Error> {
                     release_if_interrupted(&transcript);
                     false
                 }
+                // A log was created or deleted; the recompute below handles it.
+                Some(Wake::Dir) => false,
                 None => true,
             }
         };
@@ -305,14 +310,34 @@ pub fn status() -> Result<(), Error> {
         };
         let idle = now.saturating_sub(last.ts);
         let committing = event::is_unmatched_commit(&last);
-        let active = idle < timeout_for(&last);
+        let alive = last.pid.map(|pid| {
+            proc::is_alive(&ProcId {
+                pid,
+                start: last.pid_start.clone().unwrap_or_default(),
+            })
+        });
+        let interrupted = last
+            .transcript
+            .as_deref()
+            .is_some_and(|t| event::is_interrupt_transcript(Path::new(t)));
+
+        // A session is active when its process is live, not interrupted, and fresh.
+        let active = alive != Some(false) && !interrupted && idle < timeout_for(&last);
         any_active |= active;
+
         let sid = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+        let pid = match (last.pid, alive) {
+            (Some(pid), Some(true)) => format!("pid={pid}(alive)"),
+            (Some(pid), Some(false)) => format!("pid={pid}(dead)"),
+            (Some(pid), None) => format!("pid={pid}"),
+            (None, _) => "pid=?".to_string(),
+        };
         println!(
-            "  {sid}  last={} idle={idle}s  {}{}",
+            "  {sid}  last={} idle={idle}s  {pid}  {}{}{}",
             last.event,
             if active { "active" } else { "idle" },
             if committing { "  commit-in-flight" } else { "" },
+            if interrupted { "  interrupted" } else { "" },
         );
     }
 
