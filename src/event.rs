@@ -151,10 +151,9 @@ fn delete(session_id: &str) -> Result<(), Error> {
     }
 }
 
-/// Read the newest complete line of a session log, ignoring a trailing partial
-/// append. Returns `None` on an empty file, a partial-only file, or a parse
-/// failure.
-pub fn read_last_line(path: &Path) -> Option<Event> {
+/// Read the newest complete line of a file as a string, ignoring a trailing
+/// partial append. Returns `None` on an empty file or a partial-only file.
+fn tail_last_line(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     if len == 0 {
@@ -166,8 +165,25 @@ pub fn read_last_line(path: &Path) -> Option<Event> {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).ok()?;
 
-    let line = last_complete_line(&buf)?;
-    serde_json::from_str(line).ok()
+    last_complete_line(&buf).map(str::to_string)
+}
+
+/// Read the newest complete line of a session log. `None` on an empty file, a
+/// partial-only file, or a parse failure.
+pub fn read_last_line(path: &Path) -> Option<Event> {
+    serde_json::from_str(&tail_last_line(path)?).ok()
+}
+
+/// The marker Claude Code writes to a session transcript when the user interrupts
+/// a turn (Esc). Matched as a substring to tolerate the `... for tool use]`
+/// variant and future suffixes.
+const INTERRUPT_MARKER: &str = "[Request interrupted by user";
+
+/// True when a transcript's newest line is the user-interrupt marker (ADR-0011).
+/// Fail-open: an unreadable or reshaped transcript reads as false, so the session
+/// falls through to the staleness backstop rather than releasing on a bad read.
+pub fn is_interrupt_transcript(path: &Path) -> bool {
+    tail_last_line(path).is_some_and(|line| line.contains(INTERRUPT_MARKER))
 }
 
 /// The last newline-terminated line in `buf`, trimmed. Content after the final
@@ -279,6 +295,23 @@ mod tests {
         assert_eq!(event, back);
         // agent_id serializes even when null; tool/command omitted when absent.
         assert!(line.contains("\"agent_id\":null"));
+    }
+
+    #[test]
+    fn interrupt_marker_matches_only_the_marker_line() {
+        let interrupted = b"{\"type\":\"assistant\"}\n{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[Request interrupted by user for tool use]\"}]}}\n";
+        assert!(
+            last_complete_line(interrupted)
+                .unwrap()
+                .contains(INTERRUPT_MARKER)
+        );
+
+        let normal = b"{\"type\":\"assistant\",\"text\":\"still working\"}\n";
+        assert!(
+            !last_complete_line(normal)
+                .unwrap()
+                .contains(INTERRUPT_MARKER)
+        );
     }
 
     #[test]

@@ -4,9 +4,10 @@
 //! power, battery timers, caffeinate respawn, self-exit, and the staleness
 //! backstop.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use crate::config;
 use crate::error::Error;
 use crate::event::{self, Event};
 use crate::proc::{self, ProcId};
-use crate::watch::SessionWatch;
+use crate::watch::{SessionWatch, Wake};
 
 /// Spawn `vigil daemon` detached in a new session so it outlives the recorder.
 /// Best-effort: the single-instance lock makes a redundant spawn a no-op, so
@@ -73,8 +74,12 @@ pub fn run() -> Result<ExitCode, Error> {
             true
         } else {
             match watch.poll(interval) {
-                Some(dead_pid) => {
-                    remove_logs_for_pid(dead_pid);
+                Some(Wake::Exited(pid)) => {
+                    remove_logs_for_pid(pid);
+                    false
+                }
+                Some(Wake::Wrote(transcript)) => {
+                    release_if_interrupted(&transcript);
                     false
                 }
                 None => true,
@@ -135,6 +140,7 @@ pub fn run() -> Result<ExitCode, Error> {
 /// the staleness backstop, and return whether any session is active.
 fn evaluate_sessions(now: u64, watch: &mut SessionWatch) -> bool {
     let mut active = false;
+    let mut live_transcripts = HashSet::new();
     for path in session_logs() {
         let Some(last) = event::read_last_line(&path) else {
             continue;
@@ -143,7 +149,7 @@ fn evaluate_sessions(now: u64, watch: &mut SessionWatch) -> bool {
         // Liveness: register a new live PID; a PID already dead or reused at first
         // sight releases here instead of waiting for the staleness backstop.
         if let Some(pid) = last.pid
-            && !watch.is_watched(pid)
+            && !watch.is_pid_watched(pid)
         {
             let id = ProcId {
                 pid,
@@ -157,6 +163,14 @@ fn evaluate_sessions(now: u64, watch: &mut SessionWatch) -> bool {
             }
         }
 
+        // Watch the transcript so an Esc interrupt marker is seen reactively on its
+        // next write; the release itself happens in release_if_interrupted.
+        if let Some(transcript) = &last.transcript {
+            let transcript = PathBuf::from(transcript);
+            watch.watch_transcript(&transcript);
+            live_transcripts.insert(transcript);
+        }
+
         let idle = now.saturating_sub(last.ts);
         if idle < timeout_for(&last) {
             active = true;
@@ -164,6 +178,8 @@ fn evaluate_sessions(now: u64, watch: &mut SessionWatch) -> bool {
             let _ = fs::remove_file(&path);
         }
     }
+    // Close transcript watches whose session log is gone, bounding open fds.
+    watch.retain_transcripts(&live_transcripts);
     active
 }
 
@@ -172,6 +188,21 @@ fn remove_logs_for_pid(pid: u32) {
     for path in session_logs() {
         if let Some(last) = event::read_last_line(&path)
             && last.pid == Some(pid)
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// A watched transcript was written. If its newest line is the interrupt marker,
+/// the session's turn was aborted with no hook fired, so release it.
+fn release_if_interrupted(transcript: &Path) {
+    if !event::is_interrupt_transcript(transcript) {
+        return;
+    }
+    for path in session_logs() {
+        if let Some(last) = event::read_last_line(&path)
+            && last.transcript.as_deref() == transcript.to_str()
         {
             let _ = fs::remove_file(&path);
         }
