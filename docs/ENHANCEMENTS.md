@@ -35,3 +35,27 @@ the standard library has no kqueue equivalent, so the choice was crate versus ra
 **Reversibility:** the kqueue use is isolated in `src/watch.rs`; it could be
 replaced with raw `libc` `kevent` FFI, or the daemon could rely on the staleness
 backstop alone, without touching other modules.
+
+## ENH-003: Reactive log-directory watch for acquire and Stop/SessionEnd release
+
+**Spec relation:** extends the reactive sources of ADR-0011 (`EVFILT_PROC` for
+death, `EVFILT_VNODE` on transcripts for interrupts) with an `EVFILT_VNODE`/
+`NOTE_WRITE` watch on the `/tmp/vigil` log directory.
+
+`Stop`/`SessionEnd` delete a session log through the recorder, and a new turn
+creates one, but the daemon receives no kqueue event for either, so it noticed
+them only on the next housekeeping tick (within `POLL_INTERVAL`). Watching the log
+directory makes both reactive: a log created or deleted wakes the daemon at once.
+A directory `NOTE_WRITE` fires on entry create/delete, not on appends to the files
+inside it, verified on 2026-07-09 (append: no fire; create/delete: fire), so
+ordinary hook activity does not wake it. The crate is edge-triggered
+(`clear: true`), so there is no busy-loop, and the daemon's own log deletions wake
+it once to recompute, which converges.
+
+The housekeeping tick still runs for the staleness backstop, power polling,
+battery timers, and self-exit; this only removes the tick latency from the
+acquire and Stop/SessionEnd release paths.
+
+**Reversibility:** isolated to `SessionWatch::watch_dir` and the `Wake::Dir` arm
+in `daemon::run`; removing them returns those paths to tick latency without other
+change.
