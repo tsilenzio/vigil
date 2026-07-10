@@ -37,7 +37,17 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    fn as_str(self) -> &'static str {
+    /// The six events an install wires as hooks, and the order they are listed.
+    pub const ALL: [EventKind; 6] = [
+        Self::UserPromptSubmit,
+        Self::PreToolUse,
+        Self::PostToolUse,
+        Self::Stop,
+        Self::StopFailure,
+        Self::SessionEnd,
+    ];
+
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::UserPromptSubmit => "UserPromptSubmit",
             Self::PreToolUse => "PreToolUse",
