@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Keeps the Mac awake for Touch ID commit signing during long Claude Code sessions"
 authors = ["Taylor Silenzio <tsilenzio@gmail.com>"]
+license = "MIT"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
