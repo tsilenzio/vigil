@@ -3,38 +3,119 @@
 Keeps my Mac's display awake while Claude Code is actually working, so signing a
 commit with Touch ID doesn't fail when I've stepped away for a minute.
 
+[![CI](https://github.com/tsilenzio/vigil/actions/workflows/ci.yml/badge.svg)](https://github.com/tsilenzio/vigil/actions/workflows/ci.yml)
+
+macOS on Apple Silicon.
+
 ## The problem
 
 I sign every git commit with GPG through `pinentry-touchid`, and gpg-agent is set
 to cache nothing, so every commit asks for a fresh Touch ID. If I wander off and
-the screen locks, the background gpg-agent can't raise the Touch ID prompt over the
-lock screen and the commit just gets declined. Claude Code already runs
-`caffeinate` while it's busy, but only against system sleep, so the display still
-goes dark and locks on its own.
+the screen locks, the background gpg-agent can't raise the Touch ID prompt over
+the lock screen, and macOS won't hand out a biometric-protected keychain item
+while the screen is locked. The commit just gets declined. Claude Code already
+runs `caffeinate` while it's busy, but only against system sleep, so the display
+still goes dark and locks on its own during a long turn.
 
-Holding a display-wake lock is the obvious fix, but a naive one has two ways to go
-wrong. It leaks, because Claude Code fires no hook when you press Esc, or it drops
-the lock at the worst moment, because a commit sitting on the Touch ID prompt looks
-idle. vigil is the careful version.
+Holding a display-wake lock is the obvious fix, but a naive one goes wrong two
+ways. It leaks, because Claude Code fires no hook when you hit Esc to interrupt a
+turn, so a per-turn lock outlives the interrupt and can pin the screen on for
+hours. Or it lets go at the worst possible moment, because a `git commit` parked
+on the Touch ID sheet does no tool work and looks idle to anything watching for
+activity. vigil is the careful version.
 
 ## How it works
 
-Claude Code hooks call `vigil record <event>` on each lifecycle event. That appends
-a line to a per-session log in `/tmp/vigil` and makes sure the daemon is up. A
-single background daemon reads those logs, keeps one `caffeinate` alive while any
-session is active, and releases it once things have been quiet for a while. A few
-details it gets right:
+Claude Code hooks call `vigil record <event>` on each lifecycle event. That
+appends a line to a per-session log in `/tmp/vigil` and makes sure the daemon is
+up. A single background daemon reads those logs, keeps one `caffeinate -di` alive
+while any session is active, and releases it once everything's gone quiet.
 
-- It holds on a little longer around a `git commit`, so the Touch ID prompt always
-  has a lit screen to appear on.
-- One lock covers every session and subagent, counted by reference, so running
-  several Claude sessions at once doesn't stack up processes.
-- On battery it caps how long it will hold and lets go before the charge runs low,
-  so it never flattens the laptop.
+```
+hook event ──▶ vigil record ──▶ append /tmp/vigil/<session>.jsonl
+                    │                        │
+                    └── ensure daemon ──▶  vigil daemon
+                                              reads logs, reacts to kqueue events,
+                                              holds one caffeinate -di while active
+```
 
-## Status
+The whole thing is really an event-log supervisor that happens to manage a
+`caffeinate`. Keeping the display awake is the first job wired up to that log, and
+there's room to hang others off it later.
 
-The design is settled and the implementation is next. macOS on Apple Silicon only.
+## The reactive part
+
+The daemon doesn't poll for changes. It parks in a single `kqueue` and the kernel
+wakes it the moment a session actually does something:
+
+- A session killed with `SIGKILL` runs no shutdown code and fires no hook, but the
+  kernel still reports the exit through `EVFILT_PROC`, so the lock drops about 20ms
+  after the kill instead of waiting out a timeout.
+- An Esc interrupt fires no hook either. It does write a marker line to the session
+  transcript though, and a `NOTE_WRITE` watch on that file catches it the moment it
+  lands.
+- A new log file means a turn started, and a deleted one means a clean stop. A
+  watch on the log directory picks up both. Directory events fire on create and
+  delete but not on writes to the files inside, so a busy turn doesn't spam it.
+
+There's still a slow 2-second tick underneath, but only as a backstop for the one
+case nothing can signal: a session that just stops logging, with no interrupt and
+no death to react to.
+
+## A few details it gets right
+
+It holds on longer around a commit. While a session's latest event is a
+`git commit` that hasn't returned yet, that session gets a longer timeout, enough
+to sit through the Touch ID sheet and a password fallback if the biometric times
+out.
+
+Reference counting comes for free. Every session and subagent writes its own log,
+and the daemon holds the lock while any log is fresh, so five Claude sessions at
+once still boil down to one `caffeinate`. Close one and the screen stays lit for
+the rest.
+
+Liveness has to survive PID reuse, so the recorder saves more than a PID. It walks
+its own process tree up to the session's `claude` process and records that PID
+alongside its start time. If the number later gets recycled to some other process,
+the start time won't match and vigil treats the session as dead instead of keeping
+the screen on for a stranger.
+
+On battery it knows when to quit. The lock releases, and won't come back, once the
+charge hits 35% or a single continuous hold runs past three hours, whichever comes
+first. Charge only ever drops while unplugged, so that floor is all it takes to
+keep the laptop from dying with the screen pinned on. Plug in and the cap clears.
+
+And it stays out of its own way. A hook starts the daemon, an advisory `flock`
+keeps it down to one, and it shuts itself off once nothing's active. If it ever
+dies without cleaning up, the `caffeinate -t` cap expires the lock by itself.
+
+## Install
+
+```
+cargo build --release
+./target/release/vigil install
+```
+
+That copies the binary to `~/.local/share/vigil/bin/vigil`, drops a
+`~/.local/bin/vigil` symlink, and adds its six hooks to `~/.claude/settings.json`.
+Running it again is safe: it backs the file up first, only ever touches its own
+entries, and leaves the rest of your hooks alone. A half-finished install gets
+repaired, and `--force` refreshes the binary after a rebuild. `vigil uninstall`
+takes it all back out.
+
+Paths can be redirected with `VIGIL_INSTALL_DIR`, `VIGIL_RUNTIME_DIR`, and Claude
+Code's own `CLAUDE_CONFIG_DIR`.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `vigil` | Installs if it needs to, otherwise prints where things stand |
+| `vigil install [--dir P] [--force] [-y]` | Install or repair |
+| `vigil uninstall [-y]` | Pull out the hooks, binary, and runtime state |
+| `vigil status` | Live sessions, whether the lock is held, power and charge |
+| `vigil record <event>` | Log one lifecycle event (this is what the hooks call) |
+| `vigil daemon` | Run the supervisor loop (started for you) |
 
 ## Development
 
@@ -48,3 +129,15 @@ task lint         # rustfmt check + clippy
 task test
 task build        # release binary
 ```
+
+CI runs rustfmt, clippy, and the tests on macOS, and the commit messages and
+branch names get checked against conventional-commit rules on every PR.
+
+## Built with
+
+Rust, leaning on `clap`, `serde`, `kqueue`, and `libc`. No async runtime. The
+reactive loop is just one blocking `kevent`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
