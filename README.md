@@ -3,9 +3,7 @@
 Keeps my Mac's display awake while Claude Code is actually working, so signing a
 commit with Touch ID doesn't fail when I've stepped away for a minute.
 
-[![CI](https://github.com/tsilenzio/vigil/actions/workflows/ci.yml/badge.svg)](https://github.com/tsilenzio/vigil/actions/workflows/ci.yml)
-
-macOS on Apple Silicon.
+[![CI](https://github.com/tsilenzio/vigil/actions/workflows/ci.yml/badge.svg)](https://github.com/tsilenzio/vigil/actions/workflows/ci.yml) ![macOS on Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-black?logo=apple&logoColor=white)
 
 ## The problem
 
