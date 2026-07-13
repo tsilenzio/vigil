@@ -434,18 +434,24 @@ fn prune_backups(dir: &Path) {
 
 fn copy_self(dest: &Path) -> Result<(), Error> {
     let src = env::current_exe()?;
-    // Running the installed binary already: nothing to copy, and copying onto a
-    // live executable would fail with ETXTBSY.
+    // Running the installed binary already: nothing to copy.
     if canon_eq(&src, dest) {
         return Ok(());
     }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::copy(&src, dest)?;
-    let mut perms = fs::metadata(dest)?.permissions();
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    // Copy to a temp file beside the destination, then rename over it. rename
+    // repoints the directory entry to a new inode instead of rewriting the bytes
+    // of the inode a running daemon holds. An in-place overwrite invalidates the
+    // Mach-O signature and macOS SIGKILLs the next exec of the path. The temp
+    // shares the destination directory so the rename stays on one filesystem.
+    let tmp = dest.with_file_name(format!("{}.vigil-tmp", config::BIN_NAME));
+    fs::copy(&src, &tmp)?;
+    let mut perms = fs::metadata(&tmp)?.permissions();
     perms.set_mode(0o755);
-    fs::set_permissions(dest, perms)?;
+    fs::set_permissions(&tmp, perms)?;
+    fs::rename(&tmp, dest)?;
     Ok(())
 }
 
