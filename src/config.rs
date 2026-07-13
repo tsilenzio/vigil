@@ -5,7 +5,7 @@
 //! `$CLAUDE_CONFIG_DIR`, `$XDG_DATA_HOME`).
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Absolute hold cap on a single turn, seconds. Turn-span holds from
 /// `UserPromptSubmit` until `Stop`/interrupt/death/awaiting-input, so a session
@@ -98,6 +98,26 @@ pub fn symlink_path() -> PathBuf {
     home().join(".local").join("bin").join(BIN_NAME)
 }
 
+/// Where `cargo install` places the binary: `${CARGO_HOME:-~/.cargo}/bin/vigil`.
+pub fn cargo_bin_path() -> PathBuf {
+    env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".cargo"))
+        .join("bin")
+        .join(BIN_NAME)
+}
+
+/// The Homebrew front-door path for a binary running from a Cellar, or `None` if
+/// `exe` is not under a `/Cellar/` path. Homebrew installs each version under
+/// `<prefix>/Cellar/vigil/<version>/bin/vigil` and points `<prefix>/bin/vigil` at
+/// it, so the stable path is the prefix (everything before `/Cellar/`) plus
+/// `bin/vigil`. Pure string surgery, so no `brew` shell-out (ADR-0014).
+pub fn homebrew_front_door(exe: &Path) -> Option<PathBuf> {
+    let s = exe.to_str()?;
+    let idx = s.find("/Cellar/")?;
+    Some(Path::new(&s[..idx]).join("bin").join(BIN_NAME))
+}
+
 /// Claude Code config dir. `$CLAUDE_CONFIG_DIR` overrides `~/.claude`.
 pub fn claude_config_dir() -> PathBuf {
     env::var_os("CLAUDE_CONFIG_DIR")
@@ -107,4 +127,32 @@ pub fn claude_config_dir() -> PathBuf {
 
 pub fn settings_path() -> PathBuf {
     claude_config_dir().join("settings.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn homebrew_front_door_from_cellar_path() {
+        // Apple Silicon prefix.
+        assert_eq!(
+            homebrew_front_door(Path::new("/opt/homebrew/Cellar/vigil/0.1.0/bin/vigil")),
+            Some(PathBuf::from("/opt/homebrew/bin/vigil"))
+        );
+        // Intel prefix.
+        assert_eq!(
+            homebrew_front_door(Path::new("/usr/local/Cellar/vigil/0.1.0/bin/vigil")),
+            Some(PathBuf::from("/usr/local/bin/vigil"))
+        );
+        // Not a Cellar path.
+        assert_eq!(
+            homebrew_front_door(Path::new("/Users/x/.cargo/bin/vigil")),
+            None
+        );
+        assert_eq!(
+            homebrew_front_door(Path::new("/Users/x/.local/share/vigil/bin/vigil")),
+            None
+        );
+    }
 }

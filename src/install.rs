@@ -23,14 +23,20 @@ use crate::event::{self, EventKind};
 /// install or repair interactively.
 pub fn bootstrap() -> Result<(), Error> {
     let settings = read_settings()?;
-    let desired_bin = resolve_target(None, &settings);
-    let plan = build_plan(&settings, &desired_bin, false);
+    let (desired_bin, mode) = resolve_target(None, &settings);
+    let plan = build_plan(&settings, &desired_bin, mode, false);
 
     if plan.is_noop() {
         let n = EventKind::ALL.len();
         println!("vigil is installed at {}", desired_bin.display());
         println!("  hooks:   {n} of {n} wired");
-        println!("  symlink: {}", config::symlink_path().display());
+        match mode {
+            InstallMode::OwnCopy => {
+                println!("  symlink: {}", config::symlink_path().display())
+            }
+            InstallMode::Cargo => println!("  managed: cargo"),
+            InstallMode::Homebrew => println!("  managed: homebrew"),
+        }
         println!(
             "  daemon:  {}",
             if daemon_running() {
@@ -64,16 +70,20 @@ pub fn bootstrap() -> Result<(), Error> {
 /// consistent unless `force` overwrites the binary.
 pub fn install(dir: Option<PathBuf>, force: bool, assume_yes: bool) -> Result<(), Error> {
     let settings = read_settings()?;
-    let desired_bin = resolve_target(dir.as_deref(), &settings);
-    let plan = build_plan(&settings, &desired_bin, force);
+    let (desired_bin, mode) = resolve_target(dir.as_deref(), &settings);
+    let plan = build_plan(&settings, &desired_bin, mode, force);
 
     if plan.is_noop() {
+        let n = EventKind::ALL.len();
         println!("vigil is already installed at {}", desired_bin.display());
-        println!(
-            "  {} hooks wired, binary present, symlink ok",
-            EventKind::ALL.len()
-        );
-        println!("  (re-run with --force to overwrite the binary after a rebuild)");
+        match mode {
+            InstallMode::OwnCopy => {
+                println!("  {n} hooks wired, binary present, symlink ok");
+                println!("  (re-run with --force to overwrite the binary after a rebuild)");
+            }
+            InstallMode::Cargo => println!("  {n} hooks wired, cargo-managed binary"),
+            InstallMode::Homebrew => println!("  {n} hooks wired, homebrew-managed binary"),
+        }
         return Ok(());
     }
 
@@ -91,6 +101,7 @@ pub fn install(dir: Option<PathBuf>, force: bool, assume_yes: bool) -> Result<()
 /// binary, symlink, and runtime state, and stop the daemon.
 pub fn uninstall(assume_yes: bool) -> Result<(), Error> {
     let settings = read_settings()?;
+    let mode = detect_mode();
     let bin = consistent_hook_bin(&settings).unwrap_or_else(config::install_bin_path);
 
     let stripped = {
@@ -99,9 +110,12 @@ pub fn uninstall(assume_yes: bool) -> Result<(), Error> {
         s
     };
     let remove_hooks = stripped != settings;
-    let bin_present = binary_present(&bin);
+    // Managed installs (cargo/brew) own the binary and its PATH entry; vigil leaves
+    // both for `cargo uninstall` / `brew uninstall` and removes only its own state.
+    let manage_binary = !mode.is_managed();
+    let bin_present = manage_binary && binary_present(&bin);
     let link = config::symlink_path();
-    let link_is_ours = symlink_ok(&bin);
+    let link_is_ours = manage_binary && symlink_ok(&bin);
     let runtime = config::vigil_dir();
     let runtime_present = runtime.exists();
 
@@ -122,6 +136,14 @@ pub fn uninstall(assume_yes: bool) -> Result<(), Error> {
     }
     if link_is_ours {
         println!("  remove symlink {}", link.display());
+    }
+    if mode.is_managed() {
+        let pm = if mode == InstallMode::Cargo {
+            "cargo uninstall vigil"
+        } else {
+            "brew uninstall vigil"
+        };
+        println!("  keep binary    {}  (remove with `{pm}`)", bin.display());
     }
     println!("  stop daemon    pkill -f 'vigil daemon'");
     if runtime_present {
@@ -155,8 +177,45 @@ pub fn uninstall(assume_yes: bool) -> Result<(), Error> {
     Ok(())
 }
 
+/// How vigil was obtained, which decides binary placement and hook target
+/// (ADR-0014). Managed modes leave the binary to the package manager.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InstallMode {
+    /// Copy self to vigil's own dir and manage a PATH symlink.
+    OwnCopy,
+    /// Running from cargo's bin; hooks point there, cargo owns the binary.
+    Cargo,
+    /// Running from a Homebrew Cellar; hooks point at the brew bin symlink.
+    Homebrew,
+}
+
+impl InstallMode {
+    /// A package-managed binary vigil neither copies nor removes.
+    fn is_managed(self) -> bool {
+        matches!(self, Self::Cargo | Self::Homebrew)
+    }
+}
+
+/// Classify how the running binary was installed. An explicit `$VIGIL_INSTALL_DIR`
+/// forces own-copy; otherwise the running binary's location selects the mode.
+fn detect_mode() -> InstallMode {
+    if env::var_os("VIGIL_INSTALL_DIR").is_some() {
+        return InstallMode::OwnCopy;
+    }
+    if let Ok(exe) = env::current_exe() {
+        if config::homebrew_front_door(&exe).is_some() {
+            return InstallMode::Homebrew;
+        }
+        if canon_eq(&exe, &config::cargo_bin_path()) {
+            return InstallMode::Cargo;
+        }
+    }
+    InstallMode::OwnCopy
+}
+
 /// The set of changes an install needs. Empty (`is_noop`) means fully consistent.
 struct Plan {
+    mode: InstallMode,
     desired_bin: PathBuf,
     desired_settings: Value,
     write_settings: bool,
@@ -172,14 +231,17 @@ impl Plan {
     }
 }
 
-fn build_plan(settings: &Value, desired_bin: &Path, force: bool) -> Plan {
+fn build_plan(settings: &Value, desired_bin: &Path, mode: InstallMode, force: bool) -> Plan {
     let desired_settings = desired_settings(settings, desired_bin);
     let write_settings = &desired_settings != settings;
-    let copy_binary = force || !binary_present(desired_bin);
-    let fix_symlink = !symlink_ok(desired_bin);
+    // Managed installs (cargo/brew) own the binary and are already on PATH, so
+    // vigil neither copies the binary nor manages a PATH symlink for them.
+    let copy_binary = !mode.is_managed() && (force || !binary_present(desired_bin));
+    let fix_symlink = !mode.is_managed() && !symlink_ok(desired_bin);
     let stale = consistent_hook_bin(settings).is_some_and(|p| p != desired_bin);
 
     Plan {
+        mode,
         desired_bin: desired_bin.to_path_buf(),
         desired_settings,
         write_settings,
@@ -189,16 +251,29 @@ fn build_plan(settings: &Value, desired_bin: &Path, force: bool) -> Plan {
     }
 }
 
-/// Where the binary should live: an explicit `--dir`, then `$VIGIL_INSTALL_DIR`,
-/// then wherever the existing hooks consistently point, then the default.
-fn resolve_target(cli_dir: Option<&Path>, settings: &Value) -> PathBuf {
+/// The hook target and install mode: an explicit `--dir` or `$VIGIL_INSTALL_DIR`
+/// forces own-copy at that location; a cargo or Homebrew binary points the hooks at
+/// its own stable path; otherwise own-copy to wherever the existing hooks point, or
+/// the default (ADR-0014).
+fn resolve_target(cli_dir: Option<&Path>, settings: &Value) -> (PathBuf, InstallMode) {
     if let Some(dir) = cli_dir {
-        return dir.join("bin").join(config::BIN_NAME);
+        return (dir.join("bin").join(config::BIN_NAME), InstallMode::OwnCopy);
     }
-    if env::var_os("VIGIL_INSTALL_DIR").is_some() {
-        return config::install_bin_path();
-    }
-    consistent_hook_bin(settings).unwrap_or_else(config::install_bin_path)
+    let mode = detect_mode();
+    let target = match mode {
+        InstallMode::Homebrew => env::current_exe()
+            .ok()
+            .and_then(|e| config::homebrew_front_door(&e))
+            .unwrap_or_else(config::install_bin_path),
+        InstallMode::Cargo => config::cargo_bin_path(),
+        InstallMode::OwnCopy if env::var_os("VIGIL_INSTALL_DIR").is_some() => {
+            config::install_bin_path()
+        }
+        InstallMode::OwnCopy => {
+            consistent_hook_bin(settings).unwrap_or_else(config::install_bin_path)
+        }
+    };
+    (target, mode)
 }
 
 fn apply(plan: &Plan) -> Result<(), Error> {
@@ -537,24 +612,37 @@ fn print_install_plan(settings: &Value, plan: &Plan) {
     };
     println!("{header}\n");
 
-    if plan.copy_binary {
-        match env::current_exe() {
-            Ok(src) => println!("  copy binary    {}", src.display()),
-            Err(_) => println!("  copy binary    <this executable>"),
-        }
-        println!("              -> {}", plan.desired_bin.display());
-    } else {
-        println!("  binary         present at {}", plan.desired_bin.display());
-    }
-
-    if plan.fix_symlink {
+    if plan.mode.is_managed() {
+        let pm = if plan.mode == InstallMode::Cargo {
+            "cargo"
+        } else {
+            "homebrew"
+        };
         println!(
-            "  symlink        {} -> {}",
-            config::symlink_path().display(),
+            "  binary         {}-managed at {}",
+            pm,
             plan.desired_bin.display()
         );
     } else {
-        println!("  symlink        ok");
+        if plan.copy_binary {
+            match env::current_exe() {
+                Ok(src) => println!("  copy binary    {}", src.display()),
+                Err(_) => println!("  copy binary    <this executable>"),
+            }
+            println!("              -> {}", plan.desired_bin.display());
+        } else {
+            println!("  binary         present at {}", plan.desired_bin.display());
+        }
+
+        if plan.fix_symlink {
+            println!(
+                "  symlink        {} -> {}",
+                config::symlink_path().display(),
+                plan.desired_bin.display()
+            );
+        } else {
+            println!("  symlink        ok");
+        }
     }
 
     if plan.write_settings {
@@ -588,6 +676,39 @@ mod tests {
 
     fn bin() -> PathBuf {
         PathBuf::from("/opt/vigil/bin/vigil")
+    }
+
+    #[test]
+    fn managed_modes_leave_the_binary() {
+        assert!(InstallMode::Cargo.is_managed());
+        assert!(InstallMode::Homebrew.is_managed());
+        assert!(!InstallMode::OwnCopy.is_managed());
+    }
+
+    #[test]
+    fn dir_forces_own_copy_at_that_path() {
+        let (target, mode) = resolve_target(Some(Path::new("/opt/vigil")), &json!({}));
+        assert_eq!(target, PathBuf::from("/opt/vigil/bin/vigil"));
+        assert_eq!(mode, InstallMode::OwnCopy);
+    }
+
+    #[test]
+    fn managed_plan_skips_copy_and_symlink() {
+        // A cargo install with hooks already wired at the cargo path is a noop:
+        // no binary copy, no symlink, only settings if they differ.
+        let cargo_bin = config::cargo_bin_path();
+        let mut settings = json!({});
+        insert_vigil(&mut settings, &cargo_bin);
+        let plan = build_plan(&settings, &cargo_bin, InstallMode::Cargo, true);
+        assert!(
+            !plan.copy_binary,
+            "managed install must not copy the binary"
+        );
+        assert!(
+            !plan.fix_symlink,
+            "managed install must not manage a symlink"
+        );
+        assert!(plan.is_noop(), "already-wired cargo install is a noop");
     }
 
     #[test]
