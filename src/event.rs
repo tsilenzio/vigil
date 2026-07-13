@@ -1,6 +1,6 @@
 //! The per-session event log: the JSONL line schema, its file I/O, the recorder
-//! entry point, and commit detection. The recorder writes raw events only; the
-//! daemon derives all policy from them (ADR-0004).
+//! entry point, and the awaiting-input and interrupt-marker checks. The recorder
+//! writes raw events only; the daemon derives all policy from them (ADR-0004).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -18,8 +18,9 @@ use crate::proc;
 /// one small event each, so the last complete line lives well inside the window.
 const TAIL_CHUNK: u64 = 8192;
 
-/// The six lifecycle events wired as hooks. Terminal events end the turn or
-/// session and delete the log instead of appending.
+/// The lifecycle events wired as hooks. Terminal events end the turn or session
+/// and delete the log instead of appending. `Notification` carries the
+/// awaiting-input signal (ADR-0013).
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum EventKind {
     #[value(name = "UserPromptSubmit")]
@@ -28,6 +29,8 @@ pub enum EventKind {
     PreToolUse,
     #[value(name = "PostToolUse")]
     PostToolUse,
+    #[value(name = "Notification")]
+    Notification,
     #[value(name = "Stop")]
     Stop,
     #[value(name = "StopFailure")]
@@ -37,11 +40,12 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// The six events an install wires as hooks, and the order they are listed.
-    pub const ALL: [EventKind; 6] = [
+    /// The events an install wires as hooks, and the order they are listed.
+    pub const ALL: [EventKind; 7] = [
         Self::UserPromptSubmit,
         Self::PreToolUse,
         Self::PostToolUse,
+        Self::Notification,
         Self::Stop,
         Self::StopFailure,
         Self::SessionEnd,
@@ -52,6 +56,7 @@ impl EventKind {
             Self::UserPromptSubmit => "UserPromptSubmit",
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
+            Self::Notification => "Notification",
             Self::Stop => "Stop",
             Self::StopFailure => "StopFailure",
             Self::SessionEnd => "SessionEnd",
@@ -84,6 +89,8 @@ pub struct Event {
     pub pid_start: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_type: Option<String>,
 }
 
 /// The raw hook JSON on stdin. Only the fields the recorder extracts are named;
@@ -99,6 +106,8 @@ struct HookPayload {
     agent_id: Option<String>,
     #[serde(default)]
     transcript_path: Option<String>,
+    #[serde(default)]
+    notification_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +143,7 @@ pub fn record(kind: EventKind, hook_json: &str) -> Result<(), Error> {
         pid: identity.as_ref().map(|id| id.pid),
         pid_start: identity.map(|id| id.start),
         transcript: payload.transcript_path,
+        notification_type: payload.notification_type,
     };
     append(&payload.session_id, &event)
 }
@@ -208,45 +218,24 @@ fn last_complete_line(buf: &[u8]) -> Option<&str> {
     (!line.is_empty()).then_some(line)
 }
 
-/// True when the session's newest line is an in-flight commit: a `PreToolUse`
-/// for a `Bash` `git commit` with no `PostToolUse` after it yet.
-pub fn is_unmatched_commit(last: &Event) -> bool {
-    last.event == "PreToolUse"
-        && last.tool.as_deref() == Some("Bash")
-        && last.command.as_deref().is_some_and(is_commit_command)
-}
+/// The `notification_type` values that mean a session is waiting on the user, so
+/// the turn is no longer advancing and the hold should release after its grace
+/// (ADR-0013). `agent_completed` and `auth_success` are notifications that do not
+/// signal awaiting-input and are not listed.
+const AWAITING_INPUT_TYPES: [&str; 3] = [
+    "permission_prompt",
+    "agent_needs_input",
+    "elicitation_dialog",
+];
 
-/// True when `command` is a `git commit` invocation. Splits on shell separators
-/// so `git add -A && git commit` matches, and skips leading `git` option tokens
-/// so `git -C <dir> commit` matches. A commit run through a shell alias is not
-/// detected. Mirrors the behavioral spec in SPEC.md "Commit-aware timeout".
-pub fn is_commit_command(command: &str) -> bool {
-    command.split([';', '|', '&']).any(is_git_commit_segment)
-}
-
-fn is_git_commit_segment(segment: &str) -> bool {
-    let mut tokens = segment.split_whitespace();
-    if tokens.next() != Some("git") {
-        return false;
-    }
-
-    while let Some(token) = tokens.next() {
-        if token == "commit" {
-            return true;
-        }
-        // `-C <dir>` and `-c <name=value>` take a following value; skip it.
-        if token == "-C" || token == "-c" {
-            tokens.next();
-            continue;
-        }
-        // Any other pre-subcommand option flag.
-        if token.starts_with('-') {
-            continue;
-        }
-        // A different subcommand (`log`, `status`, ...).
-        return false;
-    }
-    false
+/// True when the session's newest line is an awaiting-input `Notification`: the
+/// turn has surfaced a permission or elicitation prompt and is waiting on the user.
+pub fn is_awaiting_input(last: &Event) -> bool {
+    last.event == "Notification"
+        && last
+            .notification_type
+            .as_deref()
+            .is_some_and(|t| AWAITING_INPUT_TYPES.contains(&t))
 }
 
 #[cfg(test)]
@@ -254,57 +243,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn commit_commands_match() {
-        assert!(is_commit_command("git commit"));
-        assert!(is_commit_command("git commit -m \"x\""));
-        assert!(is_commit_command("git -C /path commit"));
-        assert!(is_commit_command("git add -A && git commit"));
-        assert!(is_commit_command("git commit --amend"));
-        assert!(is_commit_command("git -c user.name=x commit -m y"));
-    }
-
-    #[test]
-    fn non_commit_commands_reject() {
-        assert!(!is_commit_command("git log"));
-        assert!(!is_commit_command("git status"));
-        assert!(!is_commit_command("echo git commit"));
-        assert!(!is_commit_command("git commit-tree"));
-    }
-
-    #[test]
-    fn unmatched_commit_needs_pretooluse_bash() {
-        let commit = |event: &str| Event {
+    fn awaiting_input_needs_notification_with_a_listed_type() {
+        let notif = |ty: Option<&str>| Event {
             ts: 1,
-            event: event.to_string(),
-            tool: Some("Bash".to_string()),
-            command: Some("git commit -m x".to_string()),
+            event: "Notification".to_string(),
+            notification_type: ty.map(str::to_string),
             ..Default::default()
         };
-        assert!(is_unmatched_commit(&commit("PreToolUse")));
-        // A PostToolUse for the same command means the commit returned.
-        assert!(!is_unmatched_commit(&commit("PostToolUse")));
-
-        let non_bash = Event {
-            tool: Some("Edit".to_string()),
-            ..commit("PreToolUse")
+        assert!(is_awaiting_input(&notif(Some("permission_prompt"))));
+        assert!(is_awaiting_input(&notif(Some("agent_needs_input"))));
+        assert!(is_awaiting_input(&notif(Some("elicitation_dialog"))));
+        // A notification that does not await input, or none at all.
+        assert!(!is_awaiting_input(&notif(Some("agent_completed"))));
+        assert!(!is_awaiting_input(&notif(None)));
+        // A listed type on a non-Notification event does not count.
+        let tool = Event {
+            event: "PreToolUse".to_string(),
+            notification_type: Some("permission_prompt".to_string()),
+            ..Default::default()
         };
-        assert!(!is_unmatched_commit(&non_bash));
+        assert!(!is_awaiting_input(&tool));
     }
 
     #[test]
     fn event_round_trips() {
         let event = Event {
             ts: 1751490000,
-            event: "PreToolUse".to_string(),
-            tool: Some("Bash".to_string()),
-            command: Some("git commit -m \"x\"".to_string()),
+            event: "Notification".to_string(),
+            notification_type: Some("permission_prompt".to_string()),
             ..Default::default()
         };
         let line = serde_json::to_string(&event).unwrap();
         let back: Event = serde_json::from_str(&line).unwrap();
         assert_eq!(event, back);
-        // agent_id serializes even when null; tool/command omitted when absent.
+        // agent_id serializes even when null; absent optionals are omitted.
         assert!(line.contains("\"agent_id\":null"));
+        assert!(line.contains("\"notification_type\":\"permission_prompt\""));
+        assert!(!line.contains("\"tool\":"));
     }
 
     #[test]

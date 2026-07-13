@@ -1,4 +1,4 @@
-//! Install and uninstall: place the binary, wire the six Claude Code hooks into
+//! Install and uninstall: place the binary, wire the Claude Code lifecycle hooks into
 //! `settings.json`, and reverse both. All settings edits are surgical, only
 //! vigil's own hook entries are added or removed, so hooks and settings the user
 //! added stay intact. Install is idempotent: a fully consistent install is a
@@ -27,8 +27,9 @@ pub fn bootstrap() -> Result<(), Error> {
     let plan = build_plan(&settings, &desired_bin, false);
 
     if plan.is_noop() {
+        let n = EventKind::ALL.len();
         println!("vigil is installed at {}", desired_bin.display());
-        println!("  hooks:   6 of 6 wired");
+        println!("  hooks:   {n} of {n} wired");
         println!("  symlink: {}", config::symlink_path().display());
         println!(
             "  daemon:  {}",
@@ -68,7 +69,10 @@ pub fn install(dir: Option<PathBuf>, force: bool, assume_yes: bool) -> Result<()
 
     if plan.is_noop() {
         println!("vigil is already installed at {}", desired_bin.display());
-        println!("  6 hooks wired, binary present, symlink ok");
+        println!(
+            "  {} hooks wired, binary present, symlink ok",
+            EventKind::ALL.len()
+        );
         println!("  (re-run with --force to overwrite the binary after a rebuild)");
         return Ok(());
     }
@@ -228,7 +232,7 @@ fn command_is_vigil(cmd: &str) -> bool {
     is_vigil && tokens.next() == Some("record")
 }
 
-/// The binary paths every vigil hook entry references, across the six events.
+/// The binary paths every vigil hook entry references, across all wired events.
 fn hook_bins(settings: &Value) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Some(hooks) = settings.get("hooks").and_then(Value::as_object) else {
@@ -263,7 +267,7 @@ fn consistent_hook_bin(settings: &Value) -> Option<PathBuf> {
     bins.iter().all(|b| *b == first).then_some(first)
 }
 
-/// Remove every vigil hook entry from the six event arrays, pruning any group,
+/// Remove every vigil hook entry from the wired event arrays, pruning any group,
 /// event array, or the `hooks` object left empty.
 fn strip_vigil(settings: &mut Value) {
     let Some(obj) = settings.as_object_mut() else {
@@ -313,7 +317,7 @@ fn strip_vigil(settings: &mut Value) {
     }
 }
 
-/// Append a fresh vigil hook group to each of the six events, creating the
+/// Append a fresh vigil hook group to each wired event, creating the
 /// `hooks` object and event arrays as needed.
 fn insert_vigil(settings: &mut Value, bin: &Path) {
     let obj = settings.as_object_mut().expect("settings is a JSON object");
@@ -564,7 +568,10 @@ fn print_install_plan(settings: &Value, plan: &Plan) {
             println!("  backup         settings.json.bak-<ts>  (all other hooks preserved)");
         }
     } else {
-        println!("  hooks          all 6 already wired");
+        println!(
+            "  hooks          all {} already wired",
+            EventKind::ALL.len()
+        );
     }
     println!();
 }
@@ -604,8 +611,8 @@ mod tests {
         let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 2);
         assert_eq!(pre[0]["hooks"][0]["command"], json!("/other/log.sh"));
-        // All six wired at the target path.
-        assert_eq!(hook_bins(&settings).len(), 6);
+        // All events wired at the target path.
+        assert_eq!(hook_bins(&settings).len(), EventKind::ALL.len());
         assert_eq!(
             consistent_hook_bin(&settings).as_deref(),
             Some(bin().as_path())

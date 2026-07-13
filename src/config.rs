@@ -7,18 +7,19 @@
 use std::env;
 use std::path::PathBuf;
 
-/// Idle release backstop. Death (`EVFILT_PROC`) and Esc-interrupt
-/// (`EVFILT_VNODE`) release reactively, and `Stop`/`SessionEnd` delete the log
-/// directly, so this only covers the residual: a session whose process could not
-/// be watched, or activity that stops with no signal. Above the typical gap
-/// between tool events, well under the 10-minute AC display-sleep timer.
-pub const STANDARD_TIMEOUT: u64 = 120;
+/// Absolute hold cap on a single turn, seconds. Turn-span holds from
+/// `UserPromptSubmit` until `Stop`/interrupt/death/awaiting-input, so a session
+/// with none of those signals (a `Stop` that never fired while the process stays
+/// alive with no interrupt marker) is released and GC'd only here. Sized well above
+/// any real turn; on battery the floor and max-hold guards bound the case first.
+/// Derived from log age, so it survives a daemon restart. ADR-0013.
+pub const SAFETY_CAP: u64 = 43_200;
 
-/// Applied while a commit is in flight. No reactive signal fires during a blocked
-/// commit (the tool has not returned, the process is alive, no interrupt), so this
-/// timeout holds the session active through the Touch ID sheet and any
-/// password-fallback entry.
-pub const COMMIT_TIMEOUT: u64 = 300;
+/// Grace before an awaiting-input session releases, seconds. A session whose newest
+/// line is a permission or elicitation `Notification` is waiting on the user; this
+/// holds the display briefly so it does not sleep while the user reads the dialog,
+/// then releases if no answer comes. ADR-0013.
+pub const AWAITING_INPUT_GRACE: u64 = 90;
 
 /// Housekeeping tick cadence, seconds, and the kqueue poll timeout. The daemon
 /// blocks up to this long for a reactive event, then does power, battery, and
@@ -29,9 +30,6 @@ pub const POLL_INTERVAL: u64 = 2;
 
 /// Consecutive idle polls before the daemon self-exits.
 pub const EXIT_GRACE: u32 = 2;
-
-/// Delete logs whose newest line is older than this, seconds.
-pub const GC_THRESHOLD: u64 = 300;
 
 /// caffeinate self-expiry backstop if the daemon dies without cleanup, seconds.
 pub const SAFETY_SECS: u64 = 1800;
