@@ -121,6 +121,17 @@ including the case where a session is active, on battery, and at or below the fl
 and the hold is not taken. This locks the invariant against regression during the
 turn-span change.
 
+The `BATTERY_MAX_HOLD` guard (ADR-0009) measures `now - hold_since`, where
+`hold_since` marks the start of the continuous hold. Turn-span makes holds span a
+whole turn rather than resetting every 120s, so a hold can run for hours on AC. The
+first implementation left `hold_since` running across AC, so a multi-hour AC hold
+consumed the battery budget before an unplug: on 2026-07-13 a ~14h continuous hold
+(mostly on AC) tripped the 3h guard the instant the machine was unplugged, releasing
+at 100% charge. `hold_since` is now cleared while on AC and set on the first battery
+tick, so the max-hold guard counts battery time only and each unplug starts a fresh
+budget. This matches ADR-0009's stated intent ("continuous battery-powered
+holding"). Extracted into a pure `next_hold_since` and unit-tested.
+
 ### Scan-time interrupt check
 
 The interrupt marker is checked when a session is first evaluated, alongside the

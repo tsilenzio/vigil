@@ -162,14 +162,14 @@ pub fn run() -> Result<ExitCode, Error> {
         let want_hold = hold_wanted(active, &power, battery_capped);
 
         if want_hold {
-            if hold_since.is_none() {
-                hold_since = Some(now);
-            }
             caffeinate.ensure_running()?;
         } else {
-            hold_since = None;
             caffeinate.stop();
         }
+        // hold_since marks the start of the continuous hold ON BATTERY, so the
+        // max-hold guard counts battery time only. A long hold on AC does not
+        // consume the battery budget before an unplug (ADR-0013).
+        hold_since = next_hold_since(want_hold, power.on_ac, hold_since, now);
 
         // Self-exit advances only on housekeeping ticks, not on reactive death
         // wakeups, so the grace window stays ~EXIT_GRACE * interval.
@@ -373,6 +373,19 @@ fn hold_wanted(active: bool, power: &PowerState, battery_capped: bool) -> bool {
     active && (power.on_ac || !battery_capped)
 }
 
+/// The hold-start timestamp after one tick. `hold_since` marks the start of the
+/// continuous hold ON BATTERY, so the max-hold guard measures battery time only. It
+/// is cleared whenever the hold is not wanted or the daemon is on AC, and set on the
+/// first battery tick of a hold. This keeps a long hold on AC from consuming the
+/// battery budget before an unplug (ADR-0013).
+fn next_hold_since(want_hold: bool, on_ac: bool, hold_since: Option<u64>, now: u64) -> Option<u64> {
+    if want_hold && !on_ac {
+        hold_since.or(Some(now))
+    } else {
+        None
+    }
+}
+
 /// Print current sessions, assertion state, and power state. Read-only.
 pub fn status() -> Result<(), Error> {
     let now = event::now_secs();
@@ -549,6 +562,19 @@ mod tests {
             Some(0),
             false
         ));
+    }
+
+    #[test]
+    fn hold_since_counts_battery_time_not_ac_time() {
+        // Holding on AC keeps no battery clock, so a long AC hold never accrues.
+        assert_eq!(next_hold_since(true, true, None, 100), None);
+        assert_eq!(next_hold_since(true, true, Some(50), 100), None);
+        // The clock starts on the first battery tick and then holds its start, so
+        // the max-hold budget begins at the unplug, not at the original AC hold.
+        assert_eq!(next_hold_since(true, false, None, 100), Some(100));
+        assert_eq!(next_hold_since(true, false, Some(50), 100), Some(50));
+        // Releasing clears it.
+        assert_eq!(next_hold_since(false, false, Some(50), 100), None);
     }
 
     #[test]
