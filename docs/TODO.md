@@ -1,15 +1,67 @@
 # vigil TODO
 
-Last Updated: 2026-07-13
+Last Updated: 2026-07-14
 
 Planned work and deferred decisions.
 
+## TODO-003: Daemon decision introspection
+
+**Status:** Planned. Motivated by the 2026-07-14 investigation into a daemon that
+reported active sessions but held nothing. The daemon runs detached with
+`/dev/null` stdio, so its decision state is invisible: diagnosing it needed a
+`sample` stack trace and a restart experiment, and two wrong guesses (a legitimate
+battery cap, then a deadlock) before `pmset -g log` and a restart isolated the real
+causes (see session `2026-07-14_1329_turn-span-safe-upgrade-and-overnight-fix`).
+
+Expose the daemon's live decision so `vigil status` can answer "why is it (not)
+holding" in one command, distinct from status's own independent recomputation.
+
+### Design sketch
+
+Each housekeeping tick (or on each decision change), the daemon writes a small
+state file to the runtime dir, for example `${VIGIL_RUNTIME_DIR}/daemon-state.json`,
+with the fields it just computed: `ts`, `active`, `want_hold`, `battery_capped`,
+`hold_since`, `on_ac`, `charge`, and the daemon pid. `vigil status` reads it and
+prints the daemon's actual decision and the reason it holds or releases. A stale
+`ts` (older than a few `POLL_INTERVAL`s) signals a wedged or dead daemon, which the
+current pgrep-based "daemon running" line cannot distinguish from a healthy idle
+one.
+
+### Work
+
+- Add a serde state struct and an atomic write (temp + rename, as
+  `write_settings_backed_up` does) each tick in `daemon::run`.
+- Read and render it in `daemon::status`, including a staleness note.
+- Decide write cadence: every tick is simplest; on-change avoids churn but adds
+  state. Every tick is fine (one small file write per `POLL_INTERVAL`).
+- Clean up the state file on clean exit (self-exit, disable flag, self-upgrade).
+- Consider an opt-in append-only debug log (`$VIGIL_DEBUG` env) for a rolling
+  history rather than only the latest snapshot, if the snapshot proves too thin.
+
+### Acceptance
+
+- `vigil status` shows why the daemon holds or releases (active, want_hold, and the
+  battery-cap reason) from the daemon's own last decision, not a recomputation.
+- A wedged or dead daemon is distinguishable from a healthy idle one via state
+  staleness.
+
+### Related
+
+- Session `2026-07-14_1329_turn-span-safe-upgrade-and-overnight-fix` (the diagnosis
+  that motivated this)
+- ADR-0013 (battery interactions), ADR-0007 (daemon lifecycle, detached stdio)
+
 ## TODO-002: Turn-span activity model (phase 1)
 
-**Status:** Planned. Design in ADR-0013. Supersedes the timeout-driven release
-from ADR-0006 and dissolves the commit-aware timeout from ADR-0005. Motivated by
-the 2026-07-13 mid-turn display-sleep incident (session `684e315d`), where a 245s
-gap with no hook events elapsed the 120s timeout and released the hold.
+**Status:** Phase 1 built on branch `feat/turn-span-model`, not yet merged or
+deployed (session `2026-07-14_1329_turn-span-safe-upgrade-and-overnight-fix`). Two
+follow-up fixes landed on the same branch after real-use testing: the awaiting-input
+release set was missing `idle_prompt`/`agent_completed` (held the display overnight),
+and the battery max-hold counted total hold instead of battery-only hold. Design in
+ADR-0013. Supersedes the timeout-driven release from ADR-0006 and dissolves the
+commit-aware timeout from ADR-0005. Motivated by the 2026-07-13 mid-turn
+display-sleep incident (session `684e315d`), where a 245s gap with no hook events
+elapsed the 120s timeout and released the hold.
 
 Replace the daemon's activity test with turn-span: a session is active while its
 log exists, its process is alive, its transcript's newest line is not the interrupt
