@@ -218,18 +218,24 @@ fn last_complete_line(buf: &[u8]) -> Option<&str> {
     (!line.is_empty()).then_some(line)
 }
 
-/// The `notification_type` values that mean a session is waiting on the user, so
-/// the turn is no longer advancing and the hold should release after its grace
-/// (ADR-0013). `agent_completed` and `auth_success` are notifications that do not
-/// signal awaiting-input and are not listed.
-const AWAITING_INPUT_TYPES: [&str; 3] = [
+/// The `notification_type` values that mean a session is no longer actively
+/// working, so the hold should release after its grace (ADR-0013): the user must
+/// act (`permission_prompt`, `agent_needs_input`, `elicitation_dialog`), the user
+/// has gone idle at the prompt (`idle_prompt`), or the turn finished
+/// (`agent_completed`). `auth_success` and `elicitation_complete`/`_response` mean
+/// work is resuming, so they are not listed. `idle_prompt` was added after it held
+/// the display awake overnight on an abandoned session (2026-07-13).
+const AWAITING_INPUT_TYPES: [&str; 5] = [
     "permission_prompt",
     "agent_needs_input",
     "elicitation_dialog",
+    "idle_prompt",
+    "agent_completed",
 ];
 
-/// True when the session's newest line is an awaiting-input `Notification`: the
-/// turn has surfaced a permission or elicitation prompt and is waiting on the user.
+/// True when the session's newest line is a `Notification` that means the session
+/// is not actively working (a prompt awaiting the user, the user idle at the
+/// prompt, or the turn finished), so the hold should release after its grace.
 pub fn is_awaiting_input(last: &Event) -> bool {
     last.event == "Notification"
         && last
@@ -253,8 +259,13 @@ mod tests {
         assert!(is_awaiting_input(&notif(Some("permission_prompt"))));
         assert!(is_awaiting_input(&notif(Some("agent_needs_input"))));
         assert!(is_awaiting_input(&notif(Some("elicitation_dialog"))));
-        // A notification that does not await input, or none at all.
-        assert!(!is_awaiting_input(&notif(Some("agent_completed"))));
+        // Idle at the prompt and turn-finished also release; idle_prompt held the
+        // display awake overnight before it was added to the set.
+        assert!(is_awaiting_input(&notif(Some("idle_prompt"))));
+        assert!(is_awaiting_input(&notif(Some("agent_completed"))));
+        // A notification that means work is resuming, or none at all, does not.
+        assert!(!is_awaiting_input(&notif(Some("auth_success"))));
+        assert!(!is_awaiting_input(&notif(Some("elicitation_complete"))));
         assert!(!is_awaiting_input(&notif(None)));
         // A listed type on a non-Notification event does not count.
         let tool = Event {

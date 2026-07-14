@@ -78,9 +78,18 @@ the duration of the turn, so the Touch ID sheet is covered without a special cas
 
 `Notification` is wired as a seventh hook event. The recorder appends a line
 carrying `notification_type`. A session whose newest line is one of
-`permission_prompt`, `agent_needs_input`, or `elicitation_dialog` is treated as
-awaiting the user and is not active. The next `PreToolUse` (after approval) or a
-new `UserPromptSubmit` becomes the newest line and the session is active again.
+`permission_prompt`, `agent_needs_input`, `elicitation_dialog` (the user must act),
+`idle_prompt` (the user has gone idle at the prompt), or `agent_completed` (the turn
+finished) is not actively working and is not active. `auth_success` and
+`elicitation_complete`/`_response` mean work is resuming and do not release. The next
+`PreToolUse` (after approval) or a new `UserPromptSubmit` becomes the newest line and
+the session is active again.
+
+`idle_prompt` was omitted from the release set in the first implementation. It held
+the display awake overnight on 2026-07-13: an abandoned session whose newest line was
+an `idle_prompt` Notification stayed active under the 12h safety cap and pinned the
+assertion from 20:27 to 10:44 (per `pmset -g log`). Adding `idle_prompt` and
+`agent_completed` releases such a session after the grace.
 
 Awaiting-input uses a short grace before release (target 90s) rather than
 immediate release, so the display does not sleep while the user reads a dialog
