@@ -72,6 +72,13 @@ fn binary_ident(path: &Path) -> Option<(u64, u64)> {
 pub fn run() -> Result<ExitCode, Error> {
     fs::create_dir_all(config::vigil_dir())?;
 
+    // Disabled: a sentinel file stands the daemon down (a manual off switch).
+    // Checked here so a hook-spawned daemon exits at once, and in the loop so
+    // creating the file releases reactively via the log-dir watch (ADR-0014).
+    if config::disable_flag_path().exists() {
+        return Ok(ExitCode::SUCCESS);
+    }
+
     // Held for the daemon's lifetime; the flock releases on drop at return.
     let lock = File::create(config::lock_path())?;
     if lock.try_lock().is_err() {
@@ -116,6 +123,13 @@ pub fn run() -> Result<ExitCode, Error> {
                 None => true,
             }
         };
+
+        // The disable flag can appear at any time; creating it wakes the log-dir
+        // watch, so this releases within a wake of the file landing.
+        if config::disable_flag_path().exists() {
+            caffeinate.stop();
+            return Ok(ExitCode::SUCCESS);
+        }
 
         let now = event::now_secs();
         if now.saturating_sub(last_power_poll) >= config::POWER_POLL_INTERVAL {
@@ -416,6 +430,12 @@ pub fn status() -> Result<(), Error> {
     println!("active: {any_active}");
     println!("assertion held: {}", pgrep("caffeinate -di"));
     println!("daemon running: {}", pgrep("vigil daemon"));
+    if config::disable_flag_path().exists() {
+        println!(
+            "disabled: yes  (remove {} to re-enable)",
+            config::disable_flag_path().display()
+        );
+    }
 
     match read_power() {
         Some(power) => {

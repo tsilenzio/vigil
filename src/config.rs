@@ -81,6 +81,12 @@ pub fn lock_path() -> PathBuf {
     vigil_dir().join("daemon.lock")
 }
 
+/// Sentinel that disables the daemon while present. Lives in the watched runtime
+/// dir so creating it wakes the daemon reactively (ADR-0014). Reboot-cleared.
+pub fn disable_flag_path() -> PathBuf {
+    vigil_dir().join(".disabled")
+}
+
 /// Install root. `$VIGIL_INSTALL_DIR` overrides `${XDG_DATA_HOME}/vigil`.
 pub fn install_dir() -> PathBuf {
     env::var_os("VIGIL_INSTALL_DIR")
