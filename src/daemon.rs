@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -24,10 +25,13 @@ use crate::watch::{SessionWatch, Wake};
 /// Best-effort: the single-instance lock makes a redundant spawn a no-op, so
 /// failures here never block a turn.
 pub fn ensure_running() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
+    if let Ok(exe) = std::env::current_exe() {
+        spawn_daemon(&exe);
+    }
+}
 
+/// Spawn `vigil daemon` from `exe`, detached in a new session with null stdio.
+fn spawn_daemon(exe: &Path) {
     let mut command = Command::new(exe);
     command
         .arg("daemon")
@@ -44,6 +48,23 @@ pub fn ensure_running() {
         });
     }
     let _ = command.spawn();
+}
+
+/// The path whose inode signals that a new binary was installed: the Homebrew
+/// front door when running from a Cellar (a `brew upgrade` repoints it), otherwise
+/// this executable's own path (an `install --force` or `cargo install` renames a
+/// new inode over it). The daemon respawns from this path so it follows a brew
+/// symlink flip to the new version. ADR-0014.
+fn self_watch_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(config::homebrew_front_door(&exe).unwrap_or(exe))
+}
+
+/// The `(device, inode)` the watch path resolves to, following symlinks. `None` if
+/// it cannot be stat'd.
+fn binary_ident(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
 }
 
 /// Run the supervisor loop. Acquires the single-instance lock or exits 0 if
@@ -67,6 +88,10 @@ pub fn run() -> Result<ExitCode, Error> {
     let mut battery_capped = false;
     let mut hold_since: Option<u64> = None;
     let mut idle_ticks: u32 = 0;
+
+    // Identity of the binary at our watch path, to notice a self-upgrade.
+    let watch_path = self_watch_path();
+    let self_ident = watch_path.as_deref().and_then(binary_ident);
 
     loop {
         // Reactive wait: block up to POLL_INTERVAL for a watched process to exit.
@@ -98,6 +123,19 @@ pub fn run() -> Result<ExitCode, Error> {
                 power = fresh;
             }
             last_power_poll = now;
+
+            // Self-upgrade: a new binary at the watch path (a new inode there, or a
+            // brew front-door symlink repointed to a new Cellar) means an install
+            // happened, so hand off to it. Release the lock before spawning so the
+            // successor acquires it without racing this exit (ADR-0014).
+            if let (Some(orig), Some(path)) = (self_ident, watch_path.as_deref())
+                && binary_ident(path).is_some_and(|cur| cur != orig)
+            {
+                caffeinate.stop();
+                drop(lock);
+                spawn_daemon(path);
+                return Ok(ExitCode::SUCCESS);
+            }
         }
 
         let active = evaluate_sessions(now, &mut watch);
