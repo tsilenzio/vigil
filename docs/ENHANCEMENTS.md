@@ -1,6 +1,6 @@
 # vigil ENHANCEMENTS
 
-Last Updated: 2026-07-09
+Last Updated: 2026-07-15
 
 Implementation choices that extend or diverge from the SPEC. Each entry records the
 change, how it relates to the spec, and how to reverse it.
@@ -76,8 +76,13 @@ with EPIPE.
 
 **Reversibility:** `install.rs` is self-contained and the two subcommands are
 additive. Removing the module and the `Install`/`Uninstall` variants reverts to
-wiring the six hooks by hand per SPEC. The `preserve_order` feature and the
+wiring the hooks by hand per SPEC. The `preserve_order` feature and the
 `SIGPIPE` reset are independent one-line changes.
+
+**Promoted:** described in SPEC "CLI Interface / install / uninstall" since the
+2026-07-14 spec reconciliation, which also folded in the ADR-0014 install modes
+and the disable-flag stand-down. This entry stays as the original rationale and
+verification record.
 
 ## ENH-005: Environment overrides for path locations
 
@@ -98,3 +103,6 @@ drive all three to sandbox the run.
 **Reversibility:** the reads are confined to the path functions in `config.rs`.
 Reverting each `env::var_os(...).unwrap_or_else(...)` to its constant restores the
 compiled-in paths without touching callers.
+
+**Promoted:** recorded in SPEC "Timeouts & Configuration" since the 2026-07-14
+spec reconciliation. This entry stays as the original rationale record.
