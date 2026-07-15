@@ -12,6 +12,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -145,7 +147,10 @@ pub fn uninstall(assume_yes: bool) -> Result<(), Error> {
         };
         println!("  keep binary    {}  (remove with `{pm}`)", bin.display());
     }
-    println!("  stop daemon    pkill -f 'vigil daemon'");
+    println!(
+        "  stop daemon    stand down via {} (pkill if wedged)",
+        config::disable_flag_path().display()
+    );
     if runtime_present {
         println!("  clean runtime  {}", runtime.display());
     }
@@ -157,7 +162,7 @@ pub fn uninstall(assume_yes: bool) -> Result<(), Error> {
     }
 
     // Stop the daemon first so it does not recreate runtime state mid-clean.
-    let _ = Command::new("pkill").args(["-f", "vigil daemon"]).status();
+    stop_daemon();
 
     if remove_hooks {
         write_settings_backed_up(&stripped)?;
@@ -169,7 +174,10 @@ pub fn uninstall(assume_yes: bool) -> Result<(), Error> {
     if link_is_ours {
         let _ = fs::remove_file(&link);
     }
-    if runtime_present {
+    // Rechecked rather than keyed on the plan: stop_daemon creates the disable
+    // flag inside the runtime dir, and a leftover flag would block the next
+    // install's daemon until reboot.
+    if runtime.exists() {
         let _ = fs::remove_dir_all(&runtime);
     }
 
@@ -585,6 +593,34 @@ fn daemon_running() -> bool {
         .output()
         .map(|out| out.status.success() && !out.stdout.is_empty())
         .unwrap_or(false)
+}
+
+/// Stand the daemon down and wait for its clean exit. The `.disabled` sentinel
+/// wakes the daemon reactively through its runtime-dir watch, and it exits
+/// killing its caffeinate, where a signal would orphan the caffeinate until its
+/// `-t` cap fired (ADR-0014). A daemon too wedged to see the flag within three
+/// poll intervals falls back to pkill.
+fn stop_daemon() {
+    let _ = fs::create_dir_all(config::vigil_dir());
+    let _ = fs::write(config::disable_flag_path(), b"");
+    for _ in 0..30 {
+        if lock_is_free() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let _ = Command::new("pkill").args(["-f", "vigil daemon"]).status();
+}
+
+/// Whether the daemon's single-instance flock is unheld. The daemon holds it
+/// for its lifetime, so an acquirable lock proves the daemon is gone, without
+/// the false positives of a pgrep pattern match.
+fn lock_is_free() -> bool {
+    match fs::File::create(config::lock_path()) {
+        Ok(file) => file.try_lock().is_ok(),
+        // No lock file to open means no daemon holding it.
+        Err(_) => true,
+    }
 }
 
 // --- interactive I/O ----------------------------------------------------------
