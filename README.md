@@ -56,16 +56,21 @@ wakes it the moment a session actually does something:
   watch on the log directory picks up both. Directory events fire on create and
   delete but not on writes to the files inside, so a busy turn doesn't spam it.
 
-There's still a slow 2-second tick underneath, but only as a backstop for the one
-case nothing can signal: a session that just stops logging, with no interrupt and
-no death to react to.
+There's still a slow 2-second tick underneath, but it's housekeeping: power and
+battery checks, the grace period for a session that's waiting on you, a 12-hour
+safety cap for a turn whose end signal never arrives, and the daemon shutting
+itself off once nothing's active.
 
 ## A few details it gets right
 
-It holds on longer around a commit. While a session's latest event is a
-`git commit` that hasn't returned yet, that session gets a longer timeout, enough
-to sit through the Touch ID sheet and a password fallback if the biometric times
-out.
+It holds for the whole turn. A session is held from the moment you submit a
+prompt until the turn ends, the process dies, or you interrupt it, with no
+activity timeout in between. A long silent stretch of thinking can't drop the
+lock mid-turn, and a `git commit` parked on the Touch ID sheet is just part of
+the turn, so it sits through the biometric wait and any password fallback
+without special casing. When Claude stops to ask you something, or you've gone
+idle at the prompt, the lock lingers about 90 seconds and then lets the display
+sleep.
 
 Reference counting comes for free. Every session and subagent writes its own log,
 and the daemon holds the lock while any log is fresh, so five Claude sessions at
@@ -79,8 +84,8 @@ the start time won't match and vigil treats the session as dead instead of keepi
 the screen on for a stranger.
 
 On battery it knows when to quit. The lock releases, and won't come back, once the
-charge hits 35% or a single continuous hold runs past three hours, whichever comes
-first. Charge only ever drops while unplugged, so that floor is all it takes to
+charge hits 35% or a continuous hold has spent three hours on battery, whichever
+comes first. Charge only ever drops while unplugged, so that floor is all it takes to
 keep the laptop from dying with the screen pinned on. Plug in and the cap clears.
 
 And it stays out of its own way. A hook starts the daemon, an advisory `flock`
@@ -95,7 +100,7 @@ cargo build --release
 ```
 
 That copies the binary to `~/.local/share/vigil/bin/vigil`, drops a
-`~/.local/bin/vigil` symlink, and adds its six hooks to `~/.claude/settings.json`.
+`~/.local/bin/vigil` symlink, and adds its seven hooks to `~/.claude/settings.json`.
 Running it again is safe: it backs the file up first, only ever touches its own
 entries, and leaves the rest of your hooks alone. A half-finished install gets
 repaired, and `--force` refreshes the binary after a rebuild. `vigil uninstall`
@@ -111,7 +116,7 @@ Code's own `CLAUDE_CONFIG_DIR`.
 | `vigil` | Installs if it needs to, otherwise prints where things stand |
 | `vigil install [--dir P] [--force] [-y]` | Install or repair |
 | `vigil uninstall [-y]` | Pull out the hooks, binary, and runtime state |
-| `vigil status` | Live sessions, whether the lock is held, power and charge |
+| `vigil status` | Live sessions, the daemon's last decision, power and charge |
 | `vigil record <event>` | Log one lifecycle event (this is what the hooks call) |
 | `vigil daemon` | Run the supervisor loop (started for you) |
 
