@@ -1,6 +1,6 @@
 # vigil: Technical Specification
 
-Last Updated: 2026-07-09
+Last Updated: 2026-07-14
 
 ## Overview & Motivation
 
@@ -51,11 +51,13 @@ vigil replaces the per-turn model with an **event-log-driven supervisor**:
   session is active and releases it when all sessions go idle.
 - Release is reactive. The daemon runs a kqueue event loop that wakes the instant a
   session's `claude` process exits (including a `SIGKILL`, which fires no hook) or a
-  turn is interrupted with Esc. A per-session idle timeout is the backstop for a
-  session that stops logging with no other signal.
-- The timeout applied to a session is extended while that session's most recent
-  event is an in-flight `git commit`, which keeps the display awake through the
-  Touch ID and password-fallback wait.
+  turn is interrupted with Esc.
+- Activity is turn-span (ADR-0013): a session is held from `UserPromptSubmit` until
+  the turn ends, the process dies, the turn is interrupted, or the session is
+  waiting on the user, with no activity timeout in between. An in-flight `git
+  commit` is part of the turn, so the Touch ID and password-fallback wait is
+  covered without a special case. A 12-hour safety cap on log age is the backstop
+  for a turn whose end signal never arrives.
 
 ### Scope
 
@@ -96,7 +98,7 @@ hook event ──▶ vigil record ──▶ append line to /tmp/vigil/<sid>.json
                                                ├─ log created/deleted ─▶ re-evaluate
                                                ├─ process exit        ─▶ release session
                                                ├─ Esc interrupt       ─▶ release session
-                                               └─ timeout tick        ─▶ staleness, power,
+                                               └─ timeout tick        ─▶ safety cap, power,
                                                      battery, self-exit
                                   any active? ── yes ─▶ ensure caffeinate -di
                                                └─ no ──▶ kill caffeinate, exit
@@ -123,7 +125,9 @@ Fields:
 - `ts` (u64, required): event time, epoch seconds.
 - `event` (string, required): one of the event types below.
 - `tool` (string, optional): tool name, present on `PreToolUse` / `PostToolUse`.
-- `command` (string, optional): the command string, present when `tool` is `Bash`.
+- `command` (string, optional): the command string, present when `tool` is `Bash`,
+  truncated to 1 KiB at record time so every line stays inside the tail-read
+  window. Recorded for future reactors; nothing reads it today.
 - `agent_id` (string or null, optional): non-null when the event came from a
   subagent's tool call (see Subagents).
 - `pid` (u32, optional): the session's `claude` process id, captured by the recorder
@@ -133,24 +137,29 @@ Fields:
   start time.
 - `transcript` (string, optional): path to the session transcript, watched for the
   Esc-interrupt marker.
+- `notification_type` (string, optional): present on `Notification` events, the
+  awaiting-input signal (see "Awaiting-input & the safety cap").
 
 The recorder extracts `session_id`, `tool_name`, `tool_input.command`, `agent_id`,
-and `transcript_path` from the hook JSON on stdin, and captures the `claude` process
-identity by walking its own ancestry. Absent fields are omitted or null.
+`transcript_path`, and `notification_type` from the hook JSON on stdin, and
+captures the `claude` process identity by walking its own ancestry. Absent fields
+are omitted or null.
 
 ### Event Types
 
-`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `StopFailure`,
-`SessionEnd`. The daemon treats them uniformly for freshness. `PreToolUse` and its
-`command` are additionally inspected for commit detection.
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`,
+`StopFailure`, `SessionEnd`. `UserPromptSubmit` and the tool events mark a turn in
+flight, `Notification` carries the awaiting-input signal, and the terminal three
+(`Stop`, `StopFailure`, `SessionEnd`) delete the log.
 
 ### Atomicity
 
-Each recorder invocation writes exactly one line, opened with `O_APPEND`. POSIX
-guarantees append writes below `PIPE_BUF` are atomic on a local filesystem, so
-concurrent recorders (multiple sessions, or a subagent and its parent) do not
-interleave partial lines. The daemon reads the last complete line and tolerates a
-trailing partial line by ignoring it.
+Each recorder invocation writes exactly one line, opened with `O_APPEND`. A single
+`write` to a local file does not interleave with concurrent recorders (multiple
+sessions, or a subagent and its parent). The 1 KiB `command` bound keeps every
+line well inside the 8 KiB tail-read window even under worst-case JSON escaping,
+so the newest line is always recoverable. The daemon reads the last complete line
+and tolerates a trailing partial line by ignoring it.
 
 ### Lifecycle & Cleanup
 
@@ -163,20 +172,21 @@ trailing partial line by ignoring it.
 - An Esc interrupt fires no hook and leaves the process alive. It writes an
   interrupt marker to the session transcript, which the daemon reads reactively on
   the transcript's next write, then releases the session.
-- A session whose log goes stale with no other signal is caught by the idle-timeout
-  backstop, and its log is garbage-collected once its newest line ages past the GC
-  threshold.
+- A session whose newest line is an awaiting-input `Notification` releases after a
+  90-second grace. A turn whose end signal never arrives is released, and its log
+  garbage-collected, once its log age passes the 12-hour safety cap.
 - Reboot clears `/tmp` as the final backstop.
 
 ## Hook Contract
 
 ### Wired Events
 
-The recorder is wired to six events in `~/.claude/settings.json`:
-`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `StopFailure`,
-`SessionEnd`. `PreToolUse` is the heartbeat immediately before each tool, so the
-assertion is fresh at the moment a `git commit` runs. `PostToolUse` marks
-commit-end and keeps logs fresh through long tool sequences.
+The recorder is wired to seven events in `~/.claude/settings.json`:
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`,
+`StopFailure`, `SessionEnd`. `UserPromptSubmit` starts the turn's log,
+`Notification` carries the awaiting-input signal, the terminal three delete the
+log, and the tool events keep the newest line current for `status` and future
+reactors.
 
 ### settings.json wiring
 
@@ -189,8 +199,9 @@ by absolute path, matching the existing hook style:
 ]
 ```
 
-The same shape is added for the other five events with the matching event name as
-the argument.
+The same shape is added for the other six events with the matching event name as
+the argument. `vigil install` wires all seven programmatically (see CLI
+Interface).
 
 ### Subagents
 
@@ -213,8 +224,9 @@ no-op.
 
 ### Session liveness (process identity)
 
-Staleness alone cannot distinguish a killed session from an idle one, and it delays
-release by the full timeout. To release a dead session at once, each event carries
+Log age alone cannot distinguish a killed session from a working one, and
+turn-span holds an existing log up to the safety cap. To release a dead session
+at once, each event carries
 the session's `claude` process identity. A hook runs as a descendant of that
 process, so the recorder walks its own ancestry (via `ps`) to the nearest `claude`
 ancestor and records that process's `pid` and start time. The `(pid, start)` pair is
@@ -234,17 +246,19 @@ Release and acquire decisions are driven by kqueue rather than by polling:
 - Each session's transcript is registered with `EVFILT_VNODE` / `NOTE_WRITE`. An Esc
   interrupt writes a marker line (`[Request interrupted by user`) to the transcript
   and fires no hook. The write wakes the daemon, which reads the newest transcript
-  line and releases the session if it is the marker. The read is fail-open: an
-  unreadable or reshaped transcript reads as not-interrupted and falls through to the
-  staleness backstop.
+  line and releases the session if it is the marker. The same check runs at scan
+  time, so a marker written before the daemon started is caught on the next pass.
+  The read is fail-open: an unreadable or reshaped transcript reads as
+  not-interrupted and falls through to the turn-boundary and liveness signals.
 - The `/tmp/vigil` log directory is registered with `EVFILT_VNODE` / `NOTE_WRITE`. A
   created log (a new turn) or a deleted one (a `Stop` / `SessionEnd`) fires the
   event, so acquire and clean release are reactive too. A directory write fires on
   entry create and delete, not on the appends to the files inside, so ordinary
   activity does not storm it.
 
-The housekeeping tick is left for the one thing that cannot be pushed reactively,
-the staleness backstop, alongside the periodic power, battery, and self-exit work.
+The housekeeping tick is left for what cannot be pushed reactively: the
+awaiting-input grace and the safety cap (both are the absence of a signal),
+alongside the periodic power, battery, self-upgrade, and self-exit work.
 
 ### Supervisor loop
 
@@ -252,8 +266,8 @@ The daemon blocks in the kqueue, waking on a reactive event or, failing that, on
 housekeeping timeout of `POLL_INTERVAL`. Reactive wakeups release a session as soon
 as its process exits or its turn is interrupted, and re-evaluate when a log is
 created or deleted. The timeout drives the periodic work that cannot be pushed
-reactively: the staleness scan, power polling, the battery timers, `caffeinate`
-respawn, and self-exit.
+reactively: the safety-cap and awaiting-input checks, power polling, the battery
+timers, the self-upgrade binary check, `caffeinate` respawn, and self-exit.
 
 ```
 loop:
@@ -269,8 +283,14 @@ loop:
         timeout:
             pass                  # fall through to housekeeping
 
+    if disable_flag_exists():                # .disabled: manual off switch (ADR-0014)
+        stop_caffeinate(); journal_exit("disabled"); release_lock_and_exit()
+
     now = epoch_seconds()
     refresh_power_source_if_due()            # pmset -g ps, cached POWER_POLL_INTERVAL
+    if binary_inode_changed():               # same cadence: self-upgrade (ADR-0014)
+        stop_caffeinate(); journal_exit("self-upgrade")
+        release_lock(); spawn_daemon(watch_path); exit()
 
     active = false
     for path in glob("/tmp/vigil/*.jsonl"):
@@ -278,32 +298,39 @@ loop:
         if last is None: continue
         if last.pid is newly seen:
             register it (EVFILT_PROC) if alive, else remove the log and continue
+        if newest transcript line is the interrupt marker:   # scan-time check
+            remove the log and continue      # covers a marker written pre-daemon
         register last.transcript (EVFILT_VNODE) if newly seen
-        idle = now - last.ts
-        limit = COMMIT_TIMEOUT if is_unmatched_commit(last) else STANDARD_TIMEOUT
-        if idle < limit:
-            active = true
-        else if idle > GC_THRESHOLD:
-            remove(path)
+        age = now - last.ts                  # turn-span activity (ADR-0013)
+        if age > SAFETY_CAP:
+            remove(path)                     # a turn whose end signal never came
+        else if awaiting_input(last):
+            active |= age < AWAITING_INPUT_GRACE
+        else:
+            active = true                    # held for the whole turn, no timeout
 
-    # Battery cap: hold_since marks the start of the current continuous hold
-    # PERIOD (it does NOT reset when the caffeinate child respawns on -t expiry).
-    # Two guards, OR'd, whichever fires first; the latch clears on AC.
+    # Battery cap: two guards, OR'd, whichever fires first; the latch clears on
+    # AC. hold_since marks the start of the continuous hold ON BATTERY (cleared on
+    # AC, not reset by a caffeinate -t respawn), so the max-hold guard counts
+    # battery time only and each unplug starts a fresh budget (ADR-0013).
     if on_ac:
         battery_capped = false               # plugging in clears the cap
     else if battery_pct <= BATTERY_FLOOR_PCT:
         battery_capped = true                # floor: never hold this low (death guard)
     else if hold_since is not None and (now - hold_since) > BATTERY_MAX_HOLD:
-        battery_capped = true                # time budget on a continuous hold
+        battery_capped = true                # time budget on a continuous battery hold
 
-    want_hold = active and not (on_battery and battery_capped)
+    # The cap vetoes the activity result, never folds into it, so a live turn
+    # still releases at the floor (ADR-0013 invariant).
+    want_hold = active and (on_ac or not battery_capped)
 
     if want_hold:
-        if hold_since is None: hold_since = now      # begin a hold period
-        ensure_caffeinate_running()                  # start, or respawn if -t fired
+        ensure_caffeinate_running()          # start, or respawn if -t fired
     else:
-        hold_since = None                            # end the hold period
         stop_caffeinate()
+    hold_since = (hold_since or now) if (want_hold and not on_ac) else None
+
+    journal_decision()                       # on change, plus a 60s heartbeat (TODO-003)
 
     # Self-exit advances only on housekeeping timeouts, not reactive wakeups, so the
     # grace window stays ~EXIT_GRACE * POLL_INTERVAL.
@@ -313,36 +340,41 @@ loop:
         idle_ticks += 1
         if idle_ticks >= EXIT_GRACE:
             stop_caffeinate()
+            journal_exit("idle")
             release_lock_and_exit()          # battery_capped resets with the daemon
 ```
 
-### Reference counting & the staleness backstop
+### Reference counting & turn-span activity
 
-A session counts as active when the idle time since its newest log line is under
-the applicable timeout. The assertion is held while any session is active. This
-covers concurrent sessions and subagents without special cases, since each is (or
-refreshes) a session log. Staleness is no longer the primary release path, reactive
-process-exit and interrupt handle the common cases, but it remains the backstop for
-a session that stops logging with no exit and no interrupt to react to.
+A session counts as active under the turn-span test (ADR-0013): its log exists
+(the recorder creates it on the turn's first event and deletes it on
+`Stop`/`StopFailure`/`SessionEnd`), its `claude` process is alive, its
+transcript's newest line is not the interrupt marker, its newest log line is not
+an awaiting-input `Notification` past the grace, and its log age is under the
+safety cap. There is no idle timeout between those signals: a long silent stretch
+(model thinking, a long single tool) stays held for the whole turn. The assertion
+is held while any session is active, which covers concurrent sessions and
+subagents without special cases, since each is (or refreshes) a session log.
 
-### Commit-aware timeout
+### Awaiting-input & the safety cap
 
-`is_unmatched_commit(last)` is true when `last.event == "PreToolUse"`, `last.tool
-== "Bash"`, and `last.command` matches a git-commit invocation. Recommended match:
+A session whose newest line is a `Notification` with one of `permission_prompt`,
+`agent_needs_input`, `elicitation_dialog` (the user must act), `idle_prompt` (the
+user has gone idle at the prompt), or `agent_completed` (the turn finished) is not
+actively working. It stays active through `AWAITING_INPUT_GRACE`, so the display
+does not sleep while the user reads a dialog, then releases. `auth_success` and
+the `elicitation_complete`/`_response` types mean work is resuming and do not
+release. The next appended event becomes the newest line and the session is
+active again.
 
-```
-(^|\s|;|&&|\|)\s*git(\s+-C\s+\S+|\s+-[^\s]+)*\s+commit(\s|$)
-```
-
-This catches `git commit`, `git -C <dir> commit`, and `git ... && git commit`, and
-rejects `git log`. A commit run through a shell alias is not detected; the raw
-logged command is the input, and alias detection is out of scope.
-
-While a session's newest line is an in-flight commit (the `PreToolUse` with no
-following `PostToolUse` yet), the session uses `COMMIT_TIMEOUT`. This holds the
-display awake through the blocking Touch ID sheet and any password-fallback wait.
-When `PostToolUse` arrives, the newest line changes and the session reverts to
-`STANDARD_TIMEOUT`.
+`SAFETY_CAP` on log age is the backstop for a turn whose end signal never arrived
+(a missed `Stop` while the process stays alive with no interrupt marker). No
+shorter cap applies, because a long single tool (a build, a test run) is
+indistinguishable from a missed `Stop`, and releasing mid-tool is the failure
+turn-span exists to remove. The cap derives from file state, so it survives
+daemon restarts. An in-flight `git commit` needs no special case: the blocking
+Touch ID sheet sits inside the turn, which is held throughout. The commit-aware
+timeout and its command parser are dissolved (ADR-0005, superseded by ADR-0013).
 
 ### caffeinate management
 
@@ -354,9 +386,9 @@ if there is no live child, either because none was started or because the
 kills the child. The daemon never runs more than one.
 
 Respawning after a `-t` expiry does not reset `hold_since`. The `-t` cap is a
-crash backstop at the OS-process level; `hold_since` tracks the logical hold period
-for the battery cap, so a continuous hold that outlives the safety cap is still one
-period.
+crash backstop at the OS-process level, while `hold_since` tracks the logical hold
+period on battery for the battery cap, so a continuous hold that outlives the
+safety cap is still one period.
 
 ### Self-exit & crash recovery
 
@@ -367,6 +399,17 @@ under a burst of reactive events. The window also absorbs the race where a recor
 appends a fresh line and spawns a daemon just as the current daemon decides to exit.
 On abnormal termination (SIGKILL, no cleanup), the `-t SAFETY_SECS` cap causes the
 orphaned caffeinate to self-expire, and the next recorder respawns a fresh daemon.
+
+Two further clean exits (ADR-0014). The `.disabled` sentinel in the runtime dir
+stands the daemon down: checked at startup so a daemon spawned while disabled
+exits at once, and on each loop pass, where the runtime-dir watch makes its
+creation reactive. Removing the file re-enables on the next hook, and
+`vigil uninstall` uses it to stop the daemon cleanly. Separately, the daemon
+re-stats its watch path (the Homebrew front door when running from a Cellar,
+otherwise its own executable path) every `POWER_POLL_INTERVAL`, and a changed
+`(device, inode)` means a new binary was installed, so it releases the lock,
+spawns a fresh daemon from the watch path, and exits. Every clean exit writes a
+journal line with its reason.
 
 ### Power source & battery cap
 
@@ -392,44 +435,52 @@ charge only decreases on battery, so the floor is monotonic and needs no
 hysteresis. A percentage-drop budget was considered and deferred (see ADR-0009).
 
 The cap clears when power returns to AC, or naturally when the daemon goes idle and
-exits (a fresh daemon starts uncapped). A brief idle gap that releases the
-assertion ends the hold period and resets `hold_since`, so the cap measures only
-genuinely continuous battery-powered holding, not normal work with pauses between
-turns.
+exits (a fresh daemon starts uncapped). `hold_since` is cleared while on AC and set
+on the first battery tick of a hold (ADR-0013), so the max-hold guard counts
+battery time only: a multi-hour hold on AC does not consume the budget before an
+unplug, and each unplug starts a fresh one. A brief idle gap that releases the
+assertion likewise resets `hold_since`, so the cap measures only genuinely
+continuous battery-powered holding, not normal work with pauses between turns.
 
 ## Timeouts & Configuration
 
 Compiled-in constants for this version (a `config` module):
 
-- `STANDARD_TIMEOUT` = 120s. Idle release threshold. Above the typical gap between
-  tool events, and well under the 10-minute AC display-sleep timer, so a brief
-  lapse does not sleep the display mid-turn.
-- `COMMIT_TIMEOUT` = 300s. Applied while a commit is in flight. Covers the Touch
-  ID sheet plus password-fallback entry.
+- `SAFETY_CAP` = 43200s (12 hours). Absolute cap on log age. Turn-span holds a
+  session for the whole turn, so this is the backstop for a turn whose end signal
+  never arrives, and the GC threshold for its log.
+- `AWAITING_INPUT_GRACE` = 90s. How long an awaiting-input session stays active
+  after the `Notification`, so the display does not sleep while the user reads
+  the dialog.
 - `POLL_INTERVAL` = 2s. The kqueue wait timeout and the housekeeping cadence: the
-  daemon blocks up to this long for a reactive event, then runs the staleness scan
-  and the power, battery, and self-exit housekeeping.
+  daemon blocks up to this long for a reactive event, then runs the safety-cap
+  and awaiting-input checks and the power, battery, and self-exit housekeeping.
 - `EXIT_GRACE` = 2 housekeeping ticks.
-- `GC_THRESHOLD` = 300s. Delete logs whose newest line is older than this.
 - `SAFETY_SECS` = 1800s (30 minutes). caffeinate self-expiry backstop.
 - `BATTERY_FLOOR_PCT` = 35. On battery, the assertion is released once the charge
   reaches this level and is not re-acquired until AC. This is the death-prevention
   guard: below the floor, normal power management (display sleep, then low-battery
   system sleep) is allowed to run. Set conservatively for v1 as a stand-in for the
   deferred graduated response (see `TODO.md`); lower it to use more battery.
-- `BATTERY_MAX_HOLD` = 10800s (3 hours). Maximum continuous hold on battery before
-  the assertion is released, independent of charge level. Bounds a long hold while
-  charge is still well above the floor. Generous because Apple Silicon lasts a long
-  time on battery.
+- `BATTERY_MAX_HOLD` = 10800s (3 hours). Maximum continuous battery-powered hold
+  before the assertion is released, independent of charge level. Bounds a long
+  hold while charge is still well above the floor. Time on AC does not count
+  against it.
 - `POWER_POLL_INTERVAL` = 30s. How often the power source and charge level are
-  re-read.
+  re-read, and the cadence of the self-upgrade binary check.
+- `JOURNAL_HEARTBEAT` = 60s. Decision-journal heartbeat cadence while the state
+  is unchanged.
+- `JOURNAL_MAX_BYTES` = 1 MiB. The journal rotates aside past this size.
 
 The two battery guards are OR'd: on battery, the assertion is released when charge
-reaches `BATTERY_FLOOR_PCT` or a continuous hold exceeds `BATTERY_MAX_HOLD`,
-whichever comes first. To disable one, set its constant to a no-op (floor 0, or a
-very large max-hold).
+reaches `BATTERY_FLOOR_PCT` or a continuous battery hold exceeds
+`BATTERY_MAX_HOLD`, whichever comes first. To disable one, set its constant to a
+no-op (floor 0, or a very large max-hold).
 
-No configuration file in this version. Values are changed by recompiling.
+No configuration file in this version. Timing values are changed by recompiling.
+Path locations honor `$VIGIL_RUNTIME_DIR`, `$VIGIL_INSTALL_DIR`,
+`$CLAUDE_CONFIG_DIR`, and `$XDG_DATA_HOME` (ENH-005), so an install can be
+relocated or sandboxed without a rebuild.
 
 ## CLI Interface
 
@@ -452,7 +503,9 @@ vigil daemon
 
 Runs the supervisor loop. Acquires the single-instance lock or exits 0 if another
 daemon holds it. Normally spawned detached by `record` (new session via `setsid`,
-stdio to `/dev/null`); can be run in the foreground for debugging.
+stdio to `/dev/null`); can be run in the foreground for debugging. Writes its
+decisions to the journal at `${VIGIL_RUNTIME_DIR}/daemon.log` (TODO-003): a line
+per decision change, a heartbeat while quiet, and start/exit lines with reasons.
 
 ### status
 
@@ -461,10 +514,37 @@ vigil status
 ```
 
 Prints active session logs, each session's newest event and idle time, whether a
-commit is in flight, whether a caffeinate assertion is currently held, the power
-source and charge level, and (on battery) how close each guard is to tripping (time
-left on the hold and headroom above the floor). For debugging and manual
-verification. Read-only.
+tool is in flight or the session is awaiting input, the daemon's own last
+journaled decision with its reason and a staleness verdict (a stale entry from a
+live daemon reads as wedged, one from a dead daemon is its final decision),
+whether a caffeinate assertion is currently held, and the power source and charge
+level with the battery guards' headroom. For debugging and manual verification.
+Read-only.
+
+### install / uninstall
+
+```
+vigil install [--dir P] [--force] [-y]
+vigil uninstall [-y]
+```
+
+`install` classifies where it is running from and wires the hooks at the
+appropriate stable path (ADR-0014): a Homebrew Cellar binary wires the
+`<prefix>/bin/vigil` front door, a cargo binary wires
+`${CARGO_HOME:-~/.cargo}/bin/vigil`, and anything else is copied to
+`${VIGIL_INSTALL_DIR:-~/.local/share/vigil}/bin/vigil` with a `~/.local/bin`
+PATH symlink. Own-copy replacement is by atomic rename, never an in-place
+overwrite, which would invalidate the running binary's Mach-O signature.
+Settings edits are surgical and backed up: only vigil's own hook entries are
+added or removed, and a partial install repairs to the location the existing
+hooks reference. Bare `vigil` with no subcommand reports install state, or
+offers to install or repair.
+
+`uninstall` reverses it: strips the hooks, removes the binary and symlink for
+own-copy installs (managed binaries are left to `cargo uninstall` /
+`brew uninstall`), stands the daemon down via the `.disabled` sentinel and
+confirms the exit by probing the single-instance lock (pkill only as a wedged
+fallback), and removes the runtime dir.
 
 ### Exit codes
 
@@ -476,18 +556,26 @@ even when the append fails, to protect the turn.
 ### Module Responsibilities
 
 - `main.rs`: `main() -> ExitCode` delegating to `run() -> Result<ExitCode, Error>`.
-- `cli.rs`: `clap` derive definitions (`record <EVENT>`, `daemon`, `status`).
+- `cli.rs`: `clap` derive definitions (`record <EVENT>`, `daemon`, `status`,
+  `install`, `uninstall`).
 - `error.rs`: `thiserror` `Error` enum with `exit_code()` and `From` conversions.
-- `event.rs`: the line schema (serde types), append, read-last-line, delete, commit
-  detection, and the transcript interrupt-marker check.
+- `event.rs`: the line schema (serde types), append with the command bound,
+  read-last-line, delete, the awaiting-input check, and the transcript
+  interrupt-marker check.
 - `proc.rs`: capture of the session's `claude` process identity (PID and start time)
   by ancestry walk, and the liveness check that guards against PID reuse.
 - `watch.rs`: the kqueue wrapper, registering PIDs (`EVFILT_PROC`), transcripts, and
   the log directory (`EVFILT_VNODE`) and returning reactive wake events.
-- `daemon.rs`: single-instance lock, the reactive event loop, reference counting,
-  self-exit, power-source polling, and the battery hold cap.
+- `daemon.rs`: single-instance lock, the reactive event loop, turn-span activity,
+  self-exit, self-upgrade, power-source polling, the battery hold cap, and
+  `status`.
+- `journal.rs`: the decision journal (entries, on-change/heartbeat cadence,
+  rotation, read-last).
+- `install.rs`: install modes, surgical settings wiring, binary placement, and
+  uninstall with the daemon stand-down.
 - `caffeinate.rs`: spawn and kill the one caffeinate child.
-- `config.rs`: the timeout constants and paths.
+- `config.rs`: the timeout constants, journal parameters, and paths with their
+  environment overrides.
 
 Dependencies follow the rune-keychain baseline plus JSON and detachment: `clap`
 (derive), `thiserror`, `serde` + `serde_json`, `kqueue` (the reactive event loop),
@@ -534,7 +622,10 @@ extraction for a log line:
 
 `UserPromptSubmit`, `Stop`, `StopFailure`, and `SessionEnd` carry `session_id` at
 top level, which is all the recorder needs from them (the event name comes from the
-`record <EVENT>` argument, not the payload).
+`record <EVENT>` argument, not the payload). `Notification` additionally carries
+`notification_type` (captured 2026-07-13: `permission_prompt` with a
+"Claude needs your permission" message) and a `message`, which the recorder does
+not log.
 
 ### Detaching the daemon
 
@@ -610,31 +701,37 @@ exercise the battery cap.
 
 ## Migration from the bash hooks
 
-The v1 bash hooks at `~/Code/misc/scripts/claude-caffeinate-hooks/` stay wired in
-`~/.claude/settings.json` until vigil passes the scenario matrix below. The swap
-repoints the six hook events from the bash scripts to `vigil record <event>` and
-removes the v1 groups. The v1 scripts and their README are retained until the swap
-is confirmed stable, then retired.
+Completed 2026-07-11. The v1 bash hooks at
+`~/Code/misc/scripts/claude-caffeinate-hooks/` were replaced by `vigil install`
+wiring the hook events to `vigil record <event>`. The v1 scripts are retained as
+historical reference only.
 
 ## Testing & Verification
 
 ### Unit tests
 
-- Commit detection: `git commit`, `git -C <dir> commit`, `git add -A && git
-  commit`, `git commit --amend` match; `git log`, `git status` do not.
-- Line schema round-trip (serialize then parse).
+- Line schema round-trip (serialize then parse), and the command bound: an
+  oversized command truncates on a char boundary and the worst-case line stays
+  inside the tail window.
 - `read_last_line` on empty, single-line, multi-line, and trailing-partial files.
-- Staleness and timeout selection given a synthetic newest line.
+- Turn-span activity and the awaiting-input grace given a synthetic newest line.
+- The battery invariants: the floor vetoes an active hold, and `hold_since`
+  accrues battery time only.
 - Interrupt-marker detection on a transcript's newest line.
 - Process-identity ancestry walk and the start-time liveness comparison.
+- Journal cadence (decision on change, heartbeat when quiet), rotation, and
+  read-last.
+- Settings surgery: insert/strip round-trips external hooks, stale-path
+  detection, managed-mode noops.
 
 ### Scenario matrix (manual, end-to-end)
 
-1. Normal turn: assertion held during the turn, released after idle timeout.
+1. Normal turn: assertion held for the whole turn, including a tool-free gap
+   longer than two minutes, released on `Stop`.
 2. Esc mid-turn then walk away: assertion released reactively on the interrupt
-   marker, with `STANDARD_TIMEOUT` as the backstop.
-3. Commit then AFK: the commit's `PreToolUse` holds `COMMIT_TIMEOUT`, and the
-   display stays awake through the Touch ID / password wait.
+   marker, with the scan-time marker check as the backstop.
+3. Commit then AFK: the turn stays held through the Touch ID / password wait,
+   with no timeout to outlast.
 4. Subagent tool use: a single caffeinate stays held during subagent work, none
    leaked afterward.
 5. Two concurrent sessions: one caffeinate total; ending one session does not
@@ -646,7 +743,8 @@ is confirmed stable, then retired.
 ### Manual checklist
 
 - `pmset -g assertions` shows `PreventUserIdleDisplaySleep 1` while active.
-- `vigil status` reflects sessions, commit-in-flight, and assertion state.
+- `vigil status` reflects sessions, tool-in-flight and awaiting-input states, the
+  daemon's journaled decision, and assertion state.
 - Exactly one caffeinate and one daemon under load (`pgrep -fl caffeinate`,
   `pgrep -fl 'vigil daemon'`).
 
