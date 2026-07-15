@@ -45,6 +45,14 @@ pub const BATTERY_MAX_HOLD: u64 = 10800;
 /// How often the power source and charge level are re-read, seconds.
 pub const POWER_POLL_INTERVAL: u64 = 30;
 
+/// Decision-journal heartbeat cadence, seconds. A quiet daemon writes a
+/// heartbeat this often so `status` can tell it from a wedged one (TODO-003).
+pub const JOURNAL_HEARTBEAT: u64 = 60;
+
+/// Rotate the decision journal aside once it passes this size, bytes. On-change
+/// volume is a few KB per day, so rotation is rare.
+pub const JOURNAL_MAX_BYTES: u64 = 1_048_576;
+
 /// Runtime dir for session logs and the daemon lock, `$VIGIL_RUNTIME_DIR`
 /// overrides it. `/tmp` is cleared on reboot, the final backstop for orphaned
 /// session state.
@@ -85,6 +93,12 @@ pub fn lock_path() -> PathBuf {
 /// dir so creating it wakes the daemon reactively (ADR-0014). Reboot-cleared.
 pub fn disable_flag_path() -> PathBuf {
     vigil_dir().join(".disabled")
+}
+
+/// The daemon's decision journal (TODO-003). Not `.jsonl`, which the daemon
+/// scans as session logs.
+pub fn journal_path() -> PathBuf {
+    vigil_dir().join("daemon.log")
 }
 
 /// Install root. `$VIGIL_INSTALL_DIR` overrides `${XDG_DATA_HOME}/vigil`.

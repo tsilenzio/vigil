@@ -5,6 +5,7 @@ mod daemon;
 mod error;
 mod event;
 mod install;
+mod journal;
 mod proc;
 mod watch;
 
