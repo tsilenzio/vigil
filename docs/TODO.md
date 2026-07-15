@@ -6,8 +6,10 @@ Planned work and deferred decisions.
 
 ## TODO-003: Daemon decision introspection
 
-**Status:** Planned, design settled 2026-07-14 (the original per-tick snapshot
-sketch is superseded, see rejected alternatives below). Motivated by the
+**Status:** Built 2026-07-14 on `feat/daemon-debug-log` (`src/journal.rs`).
+Design settled the same day, superseding the original per-tick snapshot sketch
+(see rejected alternatives below). Implementation settled the open items: file
+`daemon.log`, 60s heartbeat, 1 MiB rotation cap. Motivated by the
 2026-07-14 investigation into a daemon that
 reported active sessions but held nothing. The daemon runs detached with
 `/dev/null` stdio, so its decision state is invisible: diagnosing it needed a
