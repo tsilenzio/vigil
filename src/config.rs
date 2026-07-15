@@ -5,20 +5,21 @@
 //! `$CLAUDE_CONFIG_DIR`, `$XDG_DATA_HOME`).
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Idle release backstop. Death (`EVFILT_PROC`) and Esc-interrupt
-/// (`EVFILT_VNODE`) release reactively, and `Stop`/`SessionEnd` delete the log
-/// directly, so this only covers the residual: a session whose process could not
-/// be watched, or activity that stops with no signal. Above the typical gap
-/// between tool events, well under the 10-minute AC display-sleep timer.
-pub const STANDARD_TIMEOUT: u64 = 120;
+/// Absolute hold cap on a single turn, seconds. Turn-span holds from
+/// `UserPromptSubmit` until `Stop`/interrupt/death/awaiting-input, so a session
+/// with none of those signals (a `Stop` that never fired while the process stays
+/// alive with no interrupt marker) is released and GC'd only here. Sized well above
+/// any real turn; on battery the floor and max-hold guards bound the case first.
+/// Derived from log age, so it survives a daemon restart. ADR-0013.
+pub const SAFETY_CAP: u64 = 43_200;
 
-/// Applied while a commit is in flight. No reactive signal fires during a blocked
-/// commit (the tool has not returned, the process is alive, no interrupt), so this
-/// timeout holds the session active through the Touch ID sheet and any
-/// password-fallback entry.
-pub const COMMIT_TIMEOUT: u64 = 300;
+/// Grace before an awaiting-input session releases, seconds. A session whose newest
+/// line is a permission or elicitation `Notification` is waiting on the user; this
+/// holds the display briefly so it does not sleep while the user reads the dialog,
+/// then releases if no answer comes. ADR-0013.
+pub const AWAITING_INPUT_GRACE: u64 = 90;
 
 /// Housekeeping tick cadence, seconds, and the kqueue poll timeout. The daemon
 /// blocks up to this long for a reactive event, then does power, battery, and
@@ -29,9 +30,6 @@ pub const POLL_INTERVAL: u64 = 2;
 
 /// Consecutive idle polls before the daemon self-exits.
 pub const EXIT_GRACE: u32 = 2;
-
-/// Delete logs whose newest line is older than this, seconds.
-pub const GC_THRESHOLD: u64 = 300;
 
 /// caffeinate self-expiry backstop if the daemon dies without cleanup, seconds.
 pub const SAFETY_SECS: u64 = 1800;
@@ -83,6 +81,12 @@ pub fn lock_path() -> PathBuf {
     vigil_dir().join("daemon.lock")
 }
 
+/// Sentinel that disables the daemon while present. Lives in the watched runtime
+/// dir so creating it wakes the daemon reactively (ADR-0014). Reboot-cleared.
+pub fn disable_flag_path() -> PathBuf {
+    vigil_dir().join(".disabled")
+}
+
 /// Install root. `$VIGIL_INSTALL_DIR` overrides `${XDG_DATA_HOME}/vigil`.
 pub fn install_dir() -> PathBuf {
     env::var_os("VIGIL_INSTALL_DIR")
@@ -100,6 +104,26 @@ pub fn symlink_path() -> PathBuf {
     home().join(".local").join("bin").join(BIN_NAME)
 }
 
+/// Where `cargo install` places the binary: `${CARGO_HOME:-~/.cargo}/bin/vigil`.
+pub fn cargo_bin_path() -> PathBuf {
+    env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".cargo"))
+        .join("bin")
+        .join(BIN_NAME)
+}
+
+/// The Homebrew front-door path for a binary running from a Cellar, or `None` if
+/// `exe` is not under a `/Cellar/` path. Homebrew installs each version under
+/// `<prefix>/Cellar/vigil/<version>/bin/vigil` and points `<prefix>/bin/vigil` at
+/// it, so the stable path is the prefix (everything before `/Cellar/`) plus
+/// `bin/vigil`. Pure string surgery, so no `brew` shell-out (ADR-0014).
+pub fn homebrew_front_door(exe: &Path) -> Option<PathBuf> {
+    let s = exe.to_str()?;
+    let idx = s.find("/Cellar/")?;
+    Some(Path::new(&s[..idx]).join("bin").join(BIN_NAME))
+}
+
 /// Claude Code config dir. `$CLAUDE_CONFIG_DIR` overrides `~/.claude`.
 pub fn claude_config_dir() -> PathBuf {
     env::var_os("CLAUDE_CONFIG_DIR")
@@ -109,4 +133,32 @@ pub fn claude_config_dir() -> PathBuf {
 
 pub fn settings_path() -> PathBuf {
     claude_config_dir().join("settings.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn homebrew_front_door_from_cellar_path() {
+        // Apple Silicon prefix.
+        assert_eq!(
+            homebrew_front_door(Path::new("/opt/homebrew/Cellar/vigil/0.1.0/bin/vigil")),
+            Some(PathBuf::from("/opt/homebrew/bin/vigil"))
+        );
+        // Intel prefix.
+        assert_eq!(
+            homebrew_front_door(Path::new("/usr/local/Cellar/vigil/0.1.0/bin/vigil")),
+            Some(PathBuf::from("/usr/local/bin/vigil"))
+        );
+        // Not a Cellar path.
+        assert_eq!(
+            homebrew_front_door(Path::new("/Users/x/.cargo/bin/vigil")),
+            None
+        );
+        assert_eq!(
+            homebrew_front_door(Path::new("/Users/x/.local/share/vigil/bin/vigil")),
+            None
+        );
+    }
 }
