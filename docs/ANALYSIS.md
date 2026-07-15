@@ -1,13 +1,25 @@
 # vigil code analysis
 
-Last Updated: 2026-07-14
+Last Updated: 2026-07-15
 
 Findings from a full read of the repository at commit `c75c62a` on branch
 `feat/turn-span-model`: all nine `src/` modules, `docs/SPEC.md`, ADR-0001 through
 ADR-0014, `docs/TODO.md`, `docs/ENHANCEMENTS.md`, the README, and the build, CI,
 and tooling configs. Line references are against that commit and drift as the code
-changes. Entries are removed once addressed, with the removal recorded in the
-session notes of the session that closed them.
+changes. Entries are removed once addressed: each removal gets a one-line entry in
+the Resolved section below, and the removed entry's full original text is
+preserved in the closing session's notes.
+
+## Resolved
+
+- AN-001 (high): an oversized `command` made the newest log line unreadable by
+  the 8 KiB tail window, hiding the session and releasing the hold mid-turn.
+  Fixed 2026-07-14 in `6ad66d5` (1 KiB truncation at record time).
+- AN-002 (medium): uninstall's bare `pkill` orphaned the caffeinate for up to
+  its 30-minute `-t` cap. Fixed 2026-07-14 in `94a458f` (`.disabled` stand-down
+  confirmed by a flock probe, pkill only as the wedged fallback).
+- AN-003 (medium): the README described the pre-turn-span design (commit
+  timeout, staleness backstop, six hooks). Fixed 2026-07-14 in `6ad66d5`.
 
 ## Open findings
 

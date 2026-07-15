@@ -1,16 +1,17 @@
 # vigil TODO
 
-Last Updated: 2026-07-14
+Last Updated: 2026-07-15
 
 Planned work and deferred decisions.
 
 ## TODO-003: Daemon decision introspection
 
-**Status:** Built 2026-07-14 on `feat/daemon-debug-log` (`src/journal.rs`).
-Design settled the same day, superseding the original per-tick snapshot sketch
-(see rejected alternatives below). Implementation settled the open items: file
-`daemon.log`, 60s heartbeat, 1 MiB rotation cap. Motivated by the
-2026-07-14 investigation into a daemon that
+**Status:** Done. Built and merged 2026-07-14 (PR #2, squash `3495aa2`),
+deployed and verified live the same day, including a self-upgrade handoff the
+journal recorded end to end. Design settled the same day, superseding the
+original per-tick snapshot sketch (see rejected alternatives below).
+Implementation settled the open items: file `daemon.log`, 60s heartbeat, 1 MiB
+rotation cap. Motivated by the 2026-07-14 investigation into a daemon that
 reported active sessions but held nothing. The daemon runs detached with
 `/dev/null` stdio, so its decision state is invisible: diagnosing it needed a
 `sample` stack trace and a restart experiment, and two wrong guesses (a legitimate
@@ -88,8 +89,10 @@ recorder uses for session logs:
 
 ## TODO-002: Turn-span activity model (phase 1)
 
-**Status:** Phase 1 merged to `main` on 2026-07-14 (PR #1, squash `2fda072`,
-built in session `2026-07-14_1329_turn-span-safe-upgrade-and-overnight-fix`). Two
+**Status:** Done. Phase 1 merged to `main` on 2026-07-14 (PR #1, squash
+`2fda072`, built in session
+`2026-07-14_1329_turn-span-safe-upgrade-and-overnight-fix`) and deployed the
+same day, so the live daemon runs the turn-span build. Two
 follow-up fixes landed on the same branch after real-use testing: the awaiting-input
 release set was missing `idle_prompt`/`agent_completed` (held the display overnight),
 and the battery max-hold counted total hold instead of battery-only hold. Design in
