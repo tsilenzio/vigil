@@ -181,7 +181,7 @@ by documentation but not by live capture.
 
 ## SPEC impact
 
-To be applied in a dedicated spec-update session:
+Applied to `SPEC.md` in the 2026-07-14 spec-update session:
 
 - "Reference counting & the staleness backstop" and "Commit-aware timeout": replace
   the timeout-driven activity test with turn-span (log present, alive, not

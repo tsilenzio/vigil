@@ -121,7 +121,7 @@ hook. A stranded flag does not survive a reboot, since the runtime dir is under
 
 ## SPEC impact
 
-To be applied in a dedicated spec-update session:
+Applied to `SPEC.md` in the 2026-07-14 spec-update session:
 
 - "CLI Interface" / install: describe the three install modes and their hook
   targets; note atomic-rename replacement for own-copy.
