@@ -18,6 +18,7 @@ use crate::caffeinate::Caffeinate;
 use crate::config;
 use crate::error::Error;
 use crate::event::{self, Event};
+use crate::journal::{self, Journal};
 use crate::proc::{self, ProcId};
 use crate::watch::{SessionWatch, Wake};
 
@@ -85,6 +86,9 @@ pub fn run() -> Result<ExitCode, Error> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Opened only by the lock holder, keeping the journal single-writer.
+    let mut journal = Journal::start(event::now_secs());
+
     let mut watch = SessionWatch::new()?;
     // Watch the log dir so a created or deleted log (a new turn, or a
     // Stop/SessionEnd release) wakes the daemon at once.
@@ -105,22 +109,22 @@ pub fn run() -> Result<ExitCode, Error> {
         // With nothing registered the kqueue would return immediately, so sleep
         // instead to keep the housekeeping cadence steady.
         let interval = Duration::from_secs(config::POLL_INTERVAL);
-        let timed_out = if watch.is_empty() {
+        let (timed_out, wake) = if watch.is_empty() {
             thread::sleep(interval);
-            true
+            (true, "tick")
         } else {
             match watch.poll(interval) {
                 Some(Wake::Exited(pid)) => {
                     remove_logs_for_pid(pid);
-                    false
+                    (false, "process-exit")
                 }
                 Some(Wake::Wrote(transcript)) => {
                     release_if_interrupted(&transcript);
-                    false
+                    (false, "transcript")
                 }
                 // A log was created or deleted; the recompute below handles it.
-                Some(Wake::Dir) => false,
-                None => true,
+                Some(Wake::Dir) => (false, "dir"),
+                None => (true, "tick"),
             }
         };
 
@@ -128,6 +132,7 @@ pub fn run() -> Result<ExitCode, Error> {
         // watch, so this releases within a wake of the file landing.
         if config::disable_flag_path().exists() {
             caffeinate.stop();
+            journal.exit(event::now_secs(), "disabled");
             return Ok(ExitCode::SUCCESS);
         }
 
@@ -146,6 +151,7 @@ pub fn run() -> Result<ExitCode, Error> {
                 && binary_ident(path).is_some_and(|cur| cur != orig)
             {
                 caffeinate.stop();
+                journal.exit(now, "self-upgrade");
                 drop(lock);
                 spawn_daemon(path);
                 return Ok(ExitCode::SUCCESS);
@@ -171,6 +177,19 @@ pub fn run() -> Result<ExitCode, Error> {
         // consume the battery budget before an unplug (ADR-0013).
         hold_since = next_hold_since(want_hold, power.on_ac, hold_since, now);
 
+        journal.record(
+            now,
+            wake,
+            journal::State {
+                active,
+                want_hold,
+                battery_capped,
+                hold_since,
+                on_ac: power.on_ac,
+                charge: power.charge,
+            },
+        );
+
         // Self-exit advances only on housekeeping ticks, not on reactive death
         // wakeups, so the grace window stays ~EXIT_GRACE * interval.
         if active {
@@ -179,6 +198,7 @@ pub fn run() -> Result<ExitCode, Error> {
             idle_ticks += 1;
             if idle_ticks >= config::EXIT_GRACE {
                 caffeinate.stop();
+                journal.exit(now, "idle");
                 return Ok(ExitCode::SUCCESS);
             }
         }
@@ -442,7 +462,9 @@ pub fn status() -> Result<(), Error> {
 
     println!("active: {any_active}");
     println!("assertion held: {}", pgrep("caffeinate -di"));
-    println!("daemon running: {}", pgrep("vigil daemon"));
+    let daemon_running = pgrep("vigil daemon");
+    println!("daemon running: {daemon_running}");
+    render_journal(now, daemon_running);
     if config::disable_flag_path().exists() {
         println!(
             "disabled: yes  (remove {} to re-enable)",
@@ -471,6 +493,58 @@ pub fn status() -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+/// The daemon's own last journaled decision, distinct from the recomputation
+/// above: this is what the daemon actually decided, and its staleness tells a
+/// wedged daemon from a healthy quiet one (TODO-003).
+fn render_journal(now: u64, daemon_running: bool) {
+    let Some(entry) = journal::read_last(&config::journal_path()) else {
+        println!("daemon journal: (none)");
+        return;
+    };
+    let age = now.saturating_sub(entry.ts);
+
+    if entry.kind == "exit" {
+        let reason = entry.reason.as_deref().unwrap_or("?");
+        println!("daemon journal: exited ({reason}) {age}s ago");
+        return;
+    }
+
+    // A journaling daemon heartbeats every JOURNAL_HEARTBEAT, so an entry much
+    // older than that from a live daemon means it stopped making decisions.
+    let stale = age > config::JOURNAL_HEARTBEAT + 2 * config::POLL_INTERVAL;
+    let staleness = match (stale, daemon_running) {
+        (true, true) => "  (stale: daemon alive but not journaling, may be wedged)",
+        (true, false) => "  (daemon gone, final decision before death)",
+        _ => "",
+    };
+
+    match entry.state {
+        Some(s) => {
+            println!("daemon decision: {}  {age}s ago{staleness}", describe(&s));
+            let hold_since = match s.hold_since {
+                Some(v) => v.to_string(),
+                None => "none".to_string(),
+            };
+            println!(
+                "  active={} want_hold={} on_ac={} charge={}% battery_capped={} hold_since={hold_since}",
+                s.active, s.want_hold, s.on_ac, s.charge, s.battery_capped,
+            );
+        }
+        None => println!("daemon journal: {} {age}s ago{staleness}", entry.kind),
+    }
+}
+
+/// Why the daemon held or released, from its journaled decision.
+fn describe(s: &journal::State) -> &'static str {
+    if s.want_hold {
+        "holding"
+    } else if !s.active {
+        "released (no active session)"
+    } else {
+        "released (battery cap)"
+    }
 }
 
 fn pgrep(pattern: &str) -> bool {
@@ -575,6 +649,28 @@ mod tests {
         assert_eq!(next_hold_since(true, false, Some(50), 100), Some(50));
         // Releasing clears it.
         assert_eq!(next_hold_since(false, false, Some(50), 100), None);
+    }
+
+    #[test]
+    fn describe_names_the_hold_and_release_reasons() {
+        let state = |active, want_hold, battery_capped| journal::State {
+            active,
+            want_hold,
+            battery_capped,
+            hold_since: None,
+            on_ac: false,
+            charge: 50,
+        };
+        assert_eq!(describe(&state(true, true, false)), "holding");
+        assert_eq!(
+            describe(&state(false, false, false)),
+            "released (no active session)"
+        );
+        // Active on battery with the cap latched is the veto case.
+        assert_eq!(
+            describe(&state(true, false, true)),
+            "released (battery cap)"
+        );
     }
 
     #[test]

@@ -173,7 +173,7 @@ fn delete(session_id: &str) -> Result<(), Error> {
 
 /// Read the newest complete line of a file as a string, ignoring a trailing
 /// partial append. Returns `None` on an empty file or a partial-only file.
-fn tail_last_line(path: &Path) -> Option<String> {
+pub(crate) fn tail_last_line(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     if len == 0 {
