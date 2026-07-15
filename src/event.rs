@@ -18,6 +18,14 @@ use crate::proc;
 /// one small event each, so the last complete line lives well inside the window.
 const TAIL_CHUNK: u64 = 8192;
 
+/// Longest `command` recorded, bytes. The command is the one unbounded hook
+/// field, and a line longer than `TAIL_CHUNK` cannot be recovered by the tail
+/// read, which would make the session invisible to the daemon and release the
+/// hold mid-turn. 1 KiB leaves room for worst-case JSON escaping (6 bytes per
+/// byte) plus every other field inside the window. Nothing reads `command`
+/// today; it is recorded for future reactors.
+const COMMAND_MAX: usize = 1024;
+
 /// The lifecycle events wired as hooks. Terminal events end the turn or session
 /// and delete the log instead of appending. `Notification` carries the
 /// awaiting-input signal (ADR-0013).
@@ -138,7 +146,10 @@ pub fn record(kind: EventKind, hook_json: &str) -> Result<(), Error> {
         ts: now_secs(),
         event: kind.as_str().to_string(),
         tool: payload.tool_name,
-        command: payload.tool_input.and_then(|t| t.command),
+        command: payload
+            .tool_input
+            .and_then(|t| t.command)
+            .map(truncate_command),
         agent_id: payload.agent_id,
         pid: identity.as_ref().map(|id| id.pid),
         pid_start: identity.map(|id| id.start),
@@ -146,6 +157,21 @@ pub fn record(kind: EventKind, hook_json: &str) -> Result<(), Error> {
         notification_type: payload.notification_type,
     };
     append(&payload.session_id, &event)
+}
+
+/// Bound a command to `COMMAND_MAX` bytes on a char boundary, marking the cut
+/// with an ellipsis.
+fn truncate_command(command: String) -> String {
+    if command.len() <= COMMAND_MAX {
+        return command;
+    }
+    let mut end = COMMAND_MAX;
+    while !command.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = command[..end].to_string();
+    out.push('…');
+    out
 }
 
 fn append(session_id: &str, event: &Event) -> Result<(), Error> {
@@ -274,6 +300,40 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_awaiting_input(&tool));
+    }
+
+    #[test]
+    fn oversized_commands_are_bounded_on_a_char_boundary() {
+        let small = truncate_command("git commit -m \"x\"".to_string());
+        assert_eq!(small, "git commit -m \"x\"");
+
+        let big = truncate_command("x".repeat(20_000));
+        assert!(big.len() <= COMMAND_MAX + '…'.len_utf8());
+        assert!(big.ends_with('…'));
+
+        // Multibyte content cuts on a char boundary, not mid-codepoint.
+        let multi = truncate_command("é".repeat(COMMAND_MAX));
+        assert!(multi.len() <= COMMAND_MAX + '…'.len_utf8());
+        assert!(multi.ends_with('…'));
+    }
+
+    #[test]
+    fn worst_case_line_stays_inside_the_tail_window() {
+        // Control characters escape to 6 bytes each in JSON, the worst case for
+        // line growth. Even then the whole line must stay tail-readable.
+        let event = Event {
+            ts: u64::MAX,
+            event: "PreToolUse".to_string(),
+            tool: Some("Bash".to_string()),
+            command: Some(truncate_command("\u{1}".repeat(20_000))),
+            agent_id: Some("a".repeat(64)),
+            pid: Some(u32::MAX),
+            pid_start: Some("Thu Jul  2 20:20:25 2026".to_string()),
+            transcript: Some(format!("/Users/x/{}.jsonl", "d".repeat(256))),
+            notification_type: None,
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(line.len() < TAIL_CHUNK as usize);
     }
 
     #[test]
