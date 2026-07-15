@@ -6,7 +6,9 @@ Planned work and deferred decisions.
 
 ## TODO-003: Daemon decision introspection
 
-**Status:** Planned. Motivated by the 2026-07-14 investigation into a daemon that
+**Status:** Planned, design settled 2026-07-14 (the original per-tick snapshot
+sketch is superseded, see rejected alternatives below). Motivated by the
+2026-07-14 investigation into a daemon that
 reported active sessions but held nothing. The daemon runs detached with
 `/dev/null` stdio, so its decision state is invisible: diagnosing it needed a
 `sample` stack trace and a restart experiment, and two wrong guesses (a legitimate
@@ -16,34 +18,65 @@ causes (see session `2026-07-14_1329_turn-span-safe-upgrade-and-overnight-fix`).
 Expose the daemon's live decision so `vigil status` can answer "why is it (not)
 holding" in one command, distinct from status's own independent recomputation.
 
-### Design sketch
+### Design
 
-Each housekeeping tick (or on each decision change), the daemon writes a small
-state file to the runtime dir, for example `${VIGIL_RUNTIME_DIR}/daemon-state.json`,
-with the fields it just computed: `ts`, `active`, `want_hold`, `battery_capped`,
-`hold_since`, `on_ac`, `charge`, and the daemon pid. `vigil status` reads it and
-prints the daemon's actual decision and the reason it holds or releases. A stale
-`ts` (older than a few `POLL_INTERVAL`s) signals a wedged or dead daemon, which the
-current pgrep-based "daemon running" line cannot distinguish from a healthy idle
-one.
+One always-on append-only log, written with the same plain-append mechanism the
+recorder uses for session logs:
+
+- The daemon appends one JSON line to `${VIGIL_RUNTIME_DIR}/daemon.log` on each
+  decision change, carrying the fields it just computed: `ts`, `active`,
+  `want_hold`, `battery_capped`, `hold_since`, `on_ac`, `charge`, the wake
+  reason, and the daemon pid. The name must not end in `.jsonl`, which
+  `session_logs()` scans as sessions.
+- A sparse heartbeat line (every 30 to 60 seconds) distinguishes a quiet healthy
+  daemon from a wedged one.
+- A start line at daemon startup and an exit line with the reason (idle,
+  disabled, self-upgrade) on clean exit, so exit reasons are visible post-hoc.
+- Appends do not fire the runtime-dir watch (entry create/delete fires, appends
+  do not, per ADR-0012), so the daemon does not wake itself. Page-cache
+  semantics mean every line written before a SIGKILL survives the process.
+- Bounding: truncate or rotate past a small cap (around 1 MB; on-change volume
+  is a few KB per day). The log persists across daemon exits, since post-mortem
+  history is the point, and is cleared by reboot or uninstall.
+- `vigil status` reads the newest line as the daemon's own last decision and
+  prints why it holds or releases. A stale newest line with a daemon process
+  present reads as wedged. With no process, the last line is the final decision
+  before death.
+
+### Rejected alternatives (design review, 2026-07-14)
+
+- Per-tick `daemon-state.json` snapshot (the original sketch): a temp+rename
+  every tick is an entry change in the watched runtime dir, so it fires the dir
+  watch and self-wakes the daemon into a spin. The newest log line covers the
+  same need without the churn.
+- In-memory ring buffer flushed on a `.debug` sentinel: history dies with the
+  process, and the flush machinery exists only to work around that.
+- mmap-backed ring file: its survival property is the page cache, which plain
+  appends get for free. It costs fixed binary records, torn-write handling, and
+  a dependency or unsafe.
+- syslog / unified logging: retention is system-controlled (info-level entries
+  can be memory-only and short-lived), and `log show` is too slow for the
+  `status` path.
 
 ### Work
 
-- Add a serde state struct and an atomic write (temp + rename, as
-  `write_settings_backed_up` does) each tick in `daemon::run`.
-- Read and render it in `daemon::status`, including a staleness note.
-- Decide write cadence: every tick is simplest; on-change avoids churn but adds
-  state. Every tick is fine (one small file write per `POLL_INTERVAL`).
-- Clean up the state file on clean exit (self-exit, disable flag, self-upgrade).
-- Consider an opt-in append-only debug log (`$VIGIL_DEBUG` env) for a rolling
-  history rather than only the latest snapshot, if the snapshot proves too thin.
+- Log writer in `daemon::run`: on-change entries, heartbeat, start and exit
+  lines.
+- Read and render the newest line in `daemon::status`, including the staleness
+  note.
+- Size-cap handling.
+- Settle during implementation: exact field set, heartbeat cadence, cap value,
+  file name.
 
 ### Acceptance
 
-- `vigil status` shows why the daemon holds or releases (active, want_hold, and the
-  battery-cap reason) from the daemon's own last decision, not a recomputation.
-- A wedged or dead daemon is distinguishable from a healthy idle one via state
-  staleness.
+- `vigil status` shows why the daemon holds or releases (active, want_hold, and
+  the battery-cap reason) from the daemon's own last decision, not a
+  recomputation.
+- Wedged, healthy-idle, and dead daemons are distinguishable via log staleness
+  plus process presence.
+- History survives daemon death, including SIGKILL.
+- No self-wake through the runtime-dir watch.
 
 ### Related
 
@@ -53,8 +86,8 @@ one.
 
 ## TODO-002: Turn-span activity model (phase 1)
 
-**Status:** Phase 1 built on branch `feat/turn-span-model`, not yet merged or
-deployed (session `2026-07-14_1329_turn-span-safe-upgrade-and-overnight-fix`). Two
+**Status:** Phase 1 merged to `main` on 2026-07-14 (PR #1, squash `2fda072`,
+built in session `2026-07-14_1329_turn-span-safe-upgrade-and-overnight-fix`). Two
 follow-up fixes landed on the same branch after real-use testing: the awaiting-input
 release set was missing `idle_prompt`/`agent_completed` (held the display overnight),
 and the battery max-hold counted total hold instead of battery-only hold. Design in
